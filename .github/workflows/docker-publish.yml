@@ -10,7 +10,7 @@ on:
     branches: [main]
 
 env:
-  IMAGE: fourd/fourd-slicer-service
+  IMAGE: bohatskyi/fourd-slicer-service
 
 jobs:
   build:

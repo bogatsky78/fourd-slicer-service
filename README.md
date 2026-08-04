@@ -9,7 +9,7 @@ develop, and useful anywhere a print farm, a quoting page or an order pipeline
 has to turn a model file into a cost.
 
 ```bash
-docker run -d -p 8077:8000 fourd/fourd-slicer-service:latest
+docker run -d -p 8077:8000 bohatskyi/fourd-slicer-service:latest
 curl -s http://127.0.0.1:8077/engines
 ```
 
