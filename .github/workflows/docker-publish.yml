@@ -29,6 +29,11 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # `latest` is not listed here on purpose: the action's default
+      # `flavor: latest=auto` already applies it to a semver tag. Spelling it out
+      # as `type=raw,value=latest,enable={{is_default_branch}}` would be worse
+      # than redundant — that condition is about branches, so on a tag push it
+      # does nothing, and the line would suggest `latest` depends on it.
       - id: meta
         uses: docker/metadata-action@v5
         with:
@@ -36,7 +41,6 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
 
       # linux/amd64 only. The slicer binary ships as an x86-64 AppImage, so an
       # arm64 image would build and then fail at the first slice.
