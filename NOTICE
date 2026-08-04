@@ -1,0 +1,27 @@
+FourD Slicer Service
+Copyright (c) 2026 4DCode
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See LICENSE.
+
+--------------------------------------------------------------------------------
+Third-party components redistributed in the published Docker image
+--------------------------------------------------------------------------------
+
+OrcaSlicer
+  https://github.com/OrcaSlicer/OrcaSlicer
+  Licence: GNU Affero General Public License v3.0
+  Included: unmodified, extracted from the official Linux AppImage of the
+            release pinned by the ORCA_VERSION build argument.
+  Location in image: /opt/engines/orca
+  Licence text in image: /opt/engines/orca/LICENSE.txt
+  Corresponding source: available from the upstream repository above, at the
+            tag matching ORCA_VERSION.
+
+  OrcaSlicer derives from PrusaSlicer (Prusa Research) and Slic3r
+  (Alessandro Ranellucci and contributors), both AGPL-3.0, and from BambuStudio.
+
+The Docker image also contains Ubuntu base packages and Python dependencies,
+each under its own licence as declared by its distributor.

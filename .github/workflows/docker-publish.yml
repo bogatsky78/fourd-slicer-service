@@ -1,0 +1,63 @@
+name: Publish image
+
+# Tags drive releases: pushing v1.0.3 publishes 1.0.3, 1.0 and latest.
+# Pull requests build without publishing, so a broken Dockerfile is caught
+# before it reaches the registry rather than after.
+on:
+  push:
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE: fourd/fourd-slicer-service
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Only on a tag: a pull request has no business writing to the registry,
+      # and forks do not carry the secret anyway.
+      - name: Log in to Docker Hub
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # linux/amd64 only. The slicer binary ships as an x86-64 AppImage, so an
+      # arm64 image would build and then fail at the first slice.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A build that starts is not a build that slices: check the engine is
+      # actually present and reports a version before the tag is trusted.
+      - name: Smoke test
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          docker run -d --name smoke -p 8000:8000 ${{ env.IMAGE }}:latest
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/health && break || sleep 2
+          done
+          curl -fsS http://127.0.0.1:8000/engines | tee /dev/stderr | grep -q '"available":true'
+          docker rm -f smoke

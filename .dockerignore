@@ -1,0 +1,7 @@
+.git
+.github
+*.md
+!requirements.txt
+__pycache__
+*.pyc
+.venv
