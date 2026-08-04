@@ -10,6 +10,11 @@ on:
     branches: [main]
 
 env:
+  # The account name is not a secret — it is half of the image reference below,
+  # printed in the README and visible on every published tag. Keeping it as a
+  # repository secret only added a way to misconfigure the login. The token is
+  # the secret; this is not.
+  REGISTRY_USER: bohatskyi
   IMAGE: bohatskyi/fourd-slicer-service
 
 jobs:
@@ -26,7 +31,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ env.REGISTRY_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # `latest` is not listed here on purpose: the action's default

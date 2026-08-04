@@ -81,6 +81,17 @@ One fetch stage in the `Dockerfile` unpacking into `/opt/engines/<code>/`, one
 class in `engines/`, one line in `engines/registry.py`. Nothing else changes —
 not here, and not in whatever is calling the service.
 
+## Releasing
+
+Pushing a tag `vX.Y.Z` builds the image and publishes `X.Y.Z`, `X.Y` and
+`latest` to Docker Hub, then starts the container and checks the engine reports
+itself available before the tag is trusted. Pull requests build without
+publishing.
+
+The workflow needs one repository secret, `DOCKERHUB_TOKEN`, with Read & Write
+scope. The account name is not a secret and lives in the workflow's
+`REGISTRY_USER`, beside the image reference it is half of.
+
 ## Licence
 
 **AGPL-3.0.** See [LICENSE](LICENSE).
