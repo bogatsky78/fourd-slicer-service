@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from engines import registry
 from engines.base import EngineUnavailable, SliceFailed, SliceRequest
 
-app = FastAPI(title="FourD Slicer Service", version="1.0")
+app = FastAPI(title="FourD Slicer Service", version="1.1")
 
 WORKDIR_ROOT = os.environ.get("SLICER_WORKDIR", "/work")
 
@@ -76,9 +76,50 @@ async def slice_model(
 
         payload = dataclasses.asdict(result)
         payload["filament_count"] = result.filament_count
+        # asdict() flattens the nested ModelInfo without its properties, and the
+        # aggregates are the part callers read; re-serialise it properly.
+        payload["model"] = result.model.to_payload() if result.model else None
         return payload
     finally:
         # A slice leaves hundreds of MB behind; never let it accumulate.
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+@app.post("/engines/{code}/inspect")
+async def inspect_model(
+    code: str,
+    model: UploadFile = File(...),
+    scale: float = Form(1.0),
+) -> dict:
+    """Measure a model without slicing it.
+
+    Its own endpoint because geometry costs seconds where a slice costs minutes,
+    and plenty of questions — what size to show a customer, which box it ships
+    in, whether it fits the bed at all — need only the former. Takes no printer
+    profile: none of this depends on the machine.
+    """
+    engine = _engine(code)
+
+    os.makedirs(WORKDIR_ROOT, exist_ok=True)
+    workdir = tempfile.mkdtemp(dir=WORKDIR_ROOT, prefix="inspect-")
+    try:
+        source = os.path.join(workdir, os.path.basename(model.filename or "model.3mf"))
+        with open(source, "wb") as fh:
+            shutil.copyfileobj(model.file, fh)
+
+        request = SliceRequest(input_path=source, scale=scale)
+        try:
+            info = engine.inspect(request, workdir)
+        except EngineUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except SliceFailed as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": str(exc), "exit_code": exc.exit_code, "log": exc.log},
+            ) from exc
+
+        return {"engine": engine.code, "engine_version": engine.version(), "model": info.to_payload()}
+    finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 

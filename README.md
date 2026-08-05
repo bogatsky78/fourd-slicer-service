@@ -67,6 +67,7 @@ The full account of each, with the reasoning and the measurements, is in
 | `GET /engines` | Engines in this image, their versions and availability. |
 | `GET /engines/{code}/profiles` | Machine / process / filament profile names the engine knows. |
 | `POST /engines/{code}/slice` | multipart: `model`, optional `machine_profile`, `process_profile`, `filament_profiles` (`;`-separated), `scale`, `plate`. |
+| `POST /engines/{code}/inspect` | multipart: `model`, optional `scale`. Measures the model without slicing it — seconds rather than minutes, and no printer profile, because geometry does not depend on the machine. |
 
 Errors: `404` unknown engine, `503` engine missing from the image, `422` slicing
 failed — `detail` carries `exit_code` and the tail of **both** output streams,
@@ -74,6 +75,32 @@ because the reason for a refusal goes to stderr while progress goes to stdout.
 
 Slicing is synchronous and CPU-heavy: roughly 20 seconds for a multi-colour
 model. Call it from a queue, not from a request a person is waiting on.
+`/inspect` is the cheap half — about 3 seconds — for callers that only need to
+know how big something is.
+
+Both return a `model` block describing the geometry:
+
+```json
+{
+  "model": {
+    "objects": [
+      {"size_x": 41.632, "size_y": 43.921, "size_z": 48.986,
+       "volume_mm3": 22483.215, "facet_count": 1008692, "manifold": true}
+    ],
+    "object_count": 4,
+    "total_volume_mm3": 22965.693,
+    "size_x": 41.632, "size_y": 43.921, "size_z": 48.986
+  }
+}
+```
+
+**A list, not a box.** A 3MF routinely holds several printable objects — the
+keychain above is a puppy, two rings and a clip. They are printed apart and
+packed apart, so what a shipping carton has to satisfy is every piece
+individually plus their combined volume, never the extent of their arrangement
+on the print bed. The top-level `size_*` is the largest single object, for
+callers that want one number. Sizes have the request's `scale` applied; volume
+scales with its cube.
 
 ## Adding a slicer
 

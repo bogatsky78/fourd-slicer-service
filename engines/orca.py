@@ -16,6 +16,8 @@ import zipfile
 from .base import (
     EngineUnavailable,
     FilamentUsage,
+    ModelInfo,
+    ModelObject,
     SliceFailed,
     SliceRequest,
     SliceResult,
@@ -23,6 +25,9 @@ from .base import (
 )
 
 SLICE_INFO = "Metadata/slice_info.config"
+
+# `--info` prints one `key = value` per line under a `[filename]` header.
+INFO_LINE = re.compile(r"^\s*([a-z_]+)\s*=\s*(.+?)\s*$")
 
 
 class OrcaSlicerEngine(SlicerEngine):
@@ -139,9 +144,116 @@ class OrcaSlicerEngine(SlicerEngine):
                 log=self._log(proc),
             )
 
-        return self._parse(output_path, self._log(proc))
+        result = self._parse(output_path, self._log(proc))
+        # Measured off the same repaired copy the slice just consumed, so the
+        # dimensions describe exactly the geometry the weights came from.
+        result.model = self._inspect_file(source, request.scale)
+
+        return result
+
+    def inspect(self, request: SliceRequest, workdir: str) -> ModelInfo:
+        if not self.is_available():
+            raise EngineUnavailable(f"{self.code}: binary missing at {self.binary}")
+
+        # The same repair a slice needs: `--info` on an untouched Bambu project
+        # dies with `return -24` exactly as slicing does.
+        source = self.preprocess(request.input_path, workdir, {})
+
+        return self._inspect_file(source, request.scale)
 
     # -- internals ---------------------------------------------------------
+
+    def _inspect_file(self, path: str, scale: float = 1.0) -> ModelInfo:
+        """Ask the binary what the model measures.
+
+        `--allow-newer-file --no-check` are not optional here for the same
+        reason they are not optional when slicing: catalogue files are written
+        by a newer Bambu Studio than the engine, and without them `--info`
+        refuses the file with a bare `return -24` and no explanation.
+
+        `--info` reports the model as it sits in the file; `--scale` is applied
+        later, during slicing. Multiplying here is what makes the answer the
+        size of the printed object rather than of the drawing.
+        """
+        proc = self._run(
+            ["--info", "--allow-newer-file", "--no-check", path],
+            expect_success=False,
+        )
+
+        factor = scale if scale > 0 else 1.0
+        objects = [
+            self._object(block, factor)
+            for block in self._info_blocks(proc.stdout or "")
+            if {"size_x", "size_y", "size_z"} <= block.keys()
+        ]
+
+        if not objects:
+            raise SliceFailed(
+                f"{self.code}: --info reported no dimensions",
+                exit_code=proc.returncode,
+                log=self._log(proc),
+            )
+
+        return ModelInfo(objects=objects)
+
+    @staticmethod
+    def _info_blocks(stdout: str) -> list[dict[str, str]]:
+        """Split `--info` output into one dict per object.
+
+        This is the whole reason the parse is not a single flat dict: the binary
+        prints a `[filename]` header and a block of `key = value` lines **for
+        every object in the file**, reusing the same key names each time. Folding
+        them together keeps whichever object happened to come last — which on a
+        four-object keychain meant reporting the 6 mm clip as the size of the
+        model.
+        """
+        blocks: list[dict[str, str]] = []
+        current: dict[str, str] = {}
+        for line in stdout.splitlines():
+            if line.startswith("["):
+                if current:
+                    blocks.append(current)
+                current = {}
+                continue
+            match = INFO_LINE.match(line)
+            if match:
+                current[match.group(1)] = match.group(2)
+        if current:
+            blocks.append(current)
+
+        return blocks
+
+    @classmethod
+    def _object(cls, values: dict[str, str], factor: float) -> ModelObject:
+        return ModelObject(
+            size_x=round(float(values["size_x"]) * factor, 3),
+            size_y=round(float(values["size_y"]) * factor, 3),
+            size_z=round(float(values["size_z"]) * factor, 3),
+            # Volume scales with the cube of a linear factor, not with the factor.
+            volume_mm3=cls._maybe_float(values.get("volume"), factor ** 3),
+            facet_count=cls._maybe_int(values.get("number_of_facets")),
+            manifold=cls._maybe_bool(values.get("manifold")),
+        )
+
+    @staticmethod
+    def _maybe_float(raw: str | None, factor: float = 1.0) -> float | None:
+        try:
+            return round(float(raw) * factor, 3)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _maybe_int(raw: str | None) -> int | None:
+        try:
+            return int(float(raw))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _maybe_bool(raw: str | None) -> bool | None:
+        if raw is None:
+            return None
+        return raw.strip().lower() in ("yes", "true", "1")
 
     def _profile_path(self, name: str) -> str:
         """`Snapmaker/machine/Snapmaker U1 (0.4 nozzle)` -> absolute json path."""

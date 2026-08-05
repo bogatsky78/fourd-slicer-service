@@ -13,6 +13,7 @@ Every engine normalises those away and returns a SliceResult.
 from __future__ import annotations
 
 import abc
+import dataclasses
 from dataclasses import dataclass, field
 
 
@@ -29,6 +30,89 @@ class FilamentUsage:
 
 
 @dataclass
+class ModelObject:
+    """One printable object out of a file.
+
+    Its own bounding box, in its own coordinates. A 3MF routinely holds several:
+    a keychain file in this catalogue carries the puppy, two rings and a clip,
+    each of which is printed and packed as a separate piece.
+    """
+
+    size_x: float
+    size_y: float
+    size_z: float
+    volume_mm3: float | None = None
+    facet_count: int | None = None
+    manifold: bool | None = None
+
+    @property
+    def longest_edge(self) -> float:
+        return max(self.size_x, self.size_y, self.size_z)
+
+
+@dataclass
+class ModelInfo:
+    """What the model *is*, as opposed to what printing it would consume.
+
+    Geometry, so it needs no slicing and no printer profile — which is why it is
+    reachable on its own (`/inspect`) as well as folded into a slice. Sizes are
+    millimetres, volumes are cubic millimetres, and both already have the
+    request's scale applied: a caller asking about a print wants the size of the
+    thing that comes off the bed, not of the file.
+
+    **A list, not a box.** Reporting one bounding box for a multi-object file
+    would be answering a question nobody asked: the pieces are printed apart and
+    packed apart, so what a shipping box has to satisfy is every piece
+    individually plus their combined volume — never the extent of their
+    arrangement on the print bed, which is an artefact of how they were laid
+    out. The convenience `size_*` below is the largest single object, kept so a
+    caller that only wants one number does not have to sort the list itself.
+
+    `manifold` is carried through because a model that is not watertight is one
+    whose volume, and therefore whose weight estimate, cannot be trusted.
+    """
+
+    objects: list[ModelObject] = field(default_factory=list)
+
+    @property
+    def object_count(self) -> int:
+        return len(self.objects)
+
+    @property
+    def total_volume_mm3(self) -> float | None:
+        volumes = [o.volume_mm3 for o in self.objects if o.volume_mm3 is not None]
+        return round(sum(volumes), 3) if volumes else None
+
+    @property
+    def largest(self) -> ModelObject | None:
+        return max(self.objects, key=lambda o: o.longest_edge, default=None)
+
+    @property
+    def size_x(self) -> float | None:
+        return self.largest.size_x if self.largest else None
+
+    @property
+    def size_y(self) -> float | None:
+        return self.largest.size_y if self.largest else None
+
+    @property
+    def size_z(self) -> float | None:
+        return self.largest.size_z if self.largest else None
+
+    def to_payload(self) -> dict:
+        """Serialised by hand because `dataclasses.asdict` cannot see properties,
+        and the aggregates are the part most callers actually read."""
+        return {
+            "objects": [dataclasses.asdict(o) for o in self.objects],
+            "object_count": self.object_count,
+            "total_volume_mm3": self.total_volume_mm3,
+            "size_x": self.size_x,
+            "size_y": self.size_y,
+            "size_z": self.size_z,
+        }
+
+
+@dataclass
 class SliceResult:
     engine: str
     engine_version: str
@@ -38,6 +122,7 @@ class SliceResult:
     plate_count: int = 1
     warnings: list[str] = field(default_factory=list)
     raw: str | None = None
+    model: ModelInfo | None = None
 
     @property
     def filament_count(self) -> int:
@@ -93,3 +178,13 @@ class SlicerEngine(abc.ABC):
     @abc.abstractmethod
     def slice(self, request: SliceRequest, workdir: str) -> SliceResult:
         ...
+
+    @abc.abstractmethod
+    def inspect(self, request: SliceRequest, workdir: str) -> ModelInfo:
+        """Measure the model without slicing it.
+
+        Separate from slice() because the two answer different questions at
+        wildly different prices: geometry is seconds, a slice is minutes. A
+        caller that only needs to know whether a model fits in a box, or what
+        size to show a customer, must not have to pay for a slice to find out.
+        """
