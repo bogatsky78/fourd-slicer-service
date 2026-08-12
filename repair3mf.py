@@ -19,10 +19,15 @@ reaches the file.
 from __future__ import annotations
 
 import json
+import re
 import zipfile
 
 PROJECT_CONFIG = "Metadata/project_settings.config"
+MODEL_CONFIG = "Metadata/model_settings.config"
 FILAMENT_CONFIG_PREFIX = "Metadata/filament_settings_"
+
+OBJECT_ID = re.compile(r'<object\s+id="(\d+)"')
+EXTRUDER_VALUE = re.compile(r'(key="extruder"\s+value=")(\d+)(")')
 
 # key -> (offending value, replacement)
 OUT_OF_RANGE = {
@@ -81,13 +86,51 @@ def _apply_overrides(cfg: dict, overrides: dict) -> list[str]:
     return changed
 
 
-def repair(src: str, dst: str, project_overrides: dict | None = None) -> dict:
+def _rewrite_extruders(settings: str, per_object: dict) -> str:
+    """Renumber the extruder each object's parts print with.
+
+    Line-based rather than through an XML parser, and deliberately so: this file
+    is written and read by the slicer, and re-serialising it would rewrite every
+    line in the archive we hand back to it for the sake of changing a handful.
+
+    `per_object` is `{object id: {old index: new index}}`; an object not named
+    there is left exactly as it was.
+    """
+    if not per_object:
+        return settings
+
+    out = []
+    current = None
+    for line in settings.splitlines(keepends=True):
+        opened = OBJECT_ID.search(line)
+        if opened:
+            current = opened.group(1)
+        elif "</object>" in line:
+            current = None
+
+        mapping = per_object.get(current) if current else None
+        if mapping:
+            found = EXTRUDER_VALUE.search(line)
+            if found and found.group(2) in mapping:
+                line = EXTRUDER_VALUE.sub(
+                    lambda m: f"{m.group(1)}{mapping[m.group(2)]}{m.group(3)}", line
+                )
+        out.append(line)
+    return "".join(out)
+
+
+def repair(
+    src: str,
+    dst: str,
+    project_overrides: dict | None = None,
+    object_extruders: dict | None = None,
+) -> dict:
     """Write a repaired copy of `src` to `dst`. Returns a small report.
 
     `project_overrides` are applied to project_settings.config in the same pass,
-    so overriding a setting costs nothing extra — rewriting the archive a second
-    time would mean recompressing tens of megabytes of mesh for the sake of one
-    JSON key.
+    and `object_extruders` to model_settings.config, so neither costs anything
+    extra — rewriting the archive a second time would mean recompressing tens of
+    megabytes of mesh for the sake of one JSON key.
     """
     with zipfile.ZipFile(src) as zin:
         names = set(zin.namelist())
@@ -109,6 +152,14 @@ def repair(src: str, dst: str, project_overrides: dict | None = None) -> dict:
             name = item.filename
             if name == PROJECT_CONFIG:
                 continue  # rewritten below
+            if name == MODEL_CONFIG and object_extruders:
+                zout.writestr(
+                    item,
+                    _rewrite_extruders(
+                        zin.read(name).decode("utf-8"), object_extruders
+                    ),
+                )
+                continue
             if name.startswith(FILAMENT_CONFIG_PREFIX):
                 cfg = _fix_filament_config(json.loads(zin.read(name)))
                 zout.writestr(name, json.dumps(cfg, indent=4))

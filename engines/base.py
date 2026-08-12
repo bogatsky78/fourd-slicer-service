@@ -30,6 +30,31 @@ class FilamentUsage:
 
 
 @dataclass
+class PlateUsage:
+    """What one plate of a multi-plate job consumes.
+
+    A file laid out across plates is not one print but several, run one after
+    another, and the caller prices them as such: which colour sits on which
+    plate decides whether the job needs a four-head machine or four passes of a
+    one-head one. Summing the plates away would throw that away, so the totals
+    and the breakdown are both reported.
+    """
+
+    index: int
+    weight_g: float
+    print_time_sec: int | None = None
+    filaments: list[FilamentUsage] = field(default_factory=list)
+    # None means the slicer did not say, which is not the same as no changes.
+    filament_changes: int | None = None
+    warnings: list[str] = field(default_factory=list)
+    # What had to be changed before the plate would slice at all — moving a
+    # prime tower onto the bed, for instance. Reported rather than done quietly,
+    # because it says the file describes a print this machine cannot run as laid
+    # out; see OrcaSlicerEngine._remedy().
+    adjustments: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ModelObject:
     """One printable object out of a file.
 
@@ -123,10 +148,24 @@ class SliceResult:
     warnings: list[str] = field(default_factory=list)
     raw: str | None = None
     model: ModelInfo | None = None
+    plates: list[PlateUsage] = field(default_factory=list)
 
     @property
     def filament_count(self) -> int:
         return len([f for f in self.filaments if f.used_g > 0])
+
+    @property
+    def max_plate_filaments(self) -> int:
+        """Colours on the busiest plate — what decides whether the job needs a
+        machine with that many heads. The total colour count answers a different
+        question and is routinely much larger: an eleven-colour assembly whose
+        plates hold one colour each prints on a single-head machine."""
+        if not self.plates:
+            return self.filament_count
+        return max(
+            (len([f for f in p.filaments if f.used_g > 0]) for p in self.plates),
+            default=0,
+        )
 
 
 @dataclass

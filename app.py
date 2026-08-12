@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from engines import registry
 from engines.base import EngineUnavailable, SliceFailed, SliceRequest
 
-app = FastAPI(title="FourD Slicer Service", version="1.1")
+app = FastAPI(title="FourD Slicer Service", version="1.2")
 
 WORKDIR_ROOT = os.environ.get("SLICER_WORKDIR", "/work")
 
@@ -76,6 +76,10 @@ async def slice_model(
 
         payload = dataclasses.asdict(result)
         payload["filament_count"] = result.filament_count
+        # Colours on the busiest plate, which is the number a caller has to
+        # compare against a machine's head count; the total is a different
+        # question and is routinely much larger on a laid-out assembly.
+        payload["max_plate_filaments"] = result.max_plate_filaments
         # asdict() flattens the nested ModelInfo without its properties, and the
         # aggregates are the part callers read; re-serialise it properly.
         payload["model"] = result.model.to_payload() if result.model else None

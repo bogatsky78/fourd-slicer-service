@@ -32,9 +32,20 @@ curl -X POST http://127.0.0.1:8077/engines/orca/slice \
   "total_weight_g": 42.07,
   "print_time_sec": 14482,
   "plate_count": 1,
-  "filament_count": 3
+  "filament_count": 3,
+  "max_plate_filaments": 3,
+  "plates": [
+    { "index": 1, "weight_g": 42.07, "print_time_sec": 14482, "filament_changes": 416,
+      "filaments": [ { "slot": 1, "used_g": 16.54, "used_m": 5.46, "material": "PLA", "color": "#FFFFFF" } ] }
+  ]
 }
 ```
+
+**`plates` is the part a multi-plate job is about.** A model laid out across
+plates is not one print but several, run one after another, so the number that
+decides whether a machine can do the job is the colours on its busiest plate
+(`max_plate_filaments`) and not the total. An eleven-colour assembly whose plates
+hold one colour each prints on a single-head machine.
 
 ## Why this exists
 
@@ -53,6 +64,12 @@ is that boundary, and it absorbs three problems so the caller sees none of them:
   `--load-settings`, and some combinations are refused outright. Slicing a Bambu
   AMS file with a Snapmaker U1 profile dies with `return -51` and no explanation
   on stdout.
+- **An assembly laid out across plates breaks the slicer three ways.** Such a file
+  numbers its colours 1..13 and prints one plate at a time, but the binary reads
+  those numbers as print heads and dies on anything past the head count — as
+  `std::bad_alloc`, as a segfault in the brim, or as a bare `-100`, none of which
+  mentions a number out of range. The service renumbers each plate's colours into
+  the heads the machine has and numbers them back in the answer.
 - **Every slicer differs.** CLI dialect, input requirements and result format all
   vary. Engines normalise those away behind one contract.
 
@@ -70,11 +87,15 @@ The full account of each, with the reasoning and the measurements, is in
 | `POST /engines/{code}/inspect` | multipart: `model`, optional `scale`. Measures the model without slicing it — seconds rather than minutes, and no printer profile, because geometry does not depend on the machine. |
 
 Errors: `404` unknown engine, `503` engine missing from the image, `422` slicing
-failed — `detail` carries `exit_code` and the tail of **both** output streams,
-because the reason for a refusal goes to stderr while progress goes to stdout.
+failed — `detail` carries `exit_code`, the tail of **both** output streams
+(the reason for a refusal goes to stderr while progress goes to stdout) and, when
+the engine wrote one, its own sentence for what went wrong and which plate it was
+on.
 
 Slicing is synchronous and CPU-heavy: roughly 20 seconds for a multi-colour
-model. Call it from a queue, not from a request a person is waiting on.
+model, and a plate at a time for a file laid out across several — an eleven-plate
+assembly is minutes. Call it from a queue, not from a request a person is waiting
+on.
 `/inspect` is the cheap half — about 3 seconds — for callers that only need to
 know how big something is.
 
