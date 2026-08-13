@@ -7,6 +7,7 @@ the Snapmaker U1 profiles too, so nothing is lost.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from .base import (
+    Assembly,
     EngineUnavailable,
     FilamentUsage,
     ModelInfo,
@@ -380,7 +382,182 @@ class OrcaSlicerEngine(SlicerEngine):
                 log=self._log(proc),
             )
 
-        return ModelInfo(objects=objects)
+        return ModelInfo(objects=objects, assembly=self._assembly(path, objects, factor))
+
+    def _assembly(
+        self, path: str, objects: list[ModelObject], factor: float = 1.0
+    ) -> Assembly | None:
+        """How big the model is once its pieces are put together.
+
+        `--info` cannot answer this and never will: it measures each object in
+        that object's own coordinates, and where the objects sit on the plates
+        says how they were laid out for printing, not how they fit together. The
+        file does answer it, in `<assemble>` — one `assemble_item` per piece,
+        carrying the matrix that places it in the finished model. Every file in
+        the catalogue has the block, single-plate ones included, where it holds
+        the single item that is the whole toy.
+
+        So the arithmetic is one rule for both cases and gets no branch: push
+        each piece's eight bounding-box corners through its own matrix, then
+        take the extent of the pieces that are **glued to each other**.
+
+        **Not the extent of the whole block**, and that distinction is the whole
+        of this method. Studio writes `<assemble>` into every project whether or
+        not anyone ever assembled anything, and two things routinely sit in it
+        that are not part of the toy: alternative pieces (a second pig's head,
+        four spare turtle shells) and accessories parked beside the model (the
+        retriever's coffee mug, ten millimetres off its paws). Measuring the
+        block whole made the retriever 131 mm long against 95 measured by hand,
+        the chest 450 mm, and a corgi 884 mm.
+
+        So the pieces are grouped by whether their boxes meet — glued parts
+        overlap, that is what glue is — and the group holding the most material
+        is the model. What that leaves out is what the customer gets as loose
+        extras, and the answer is a lower bound by exactly those. Verified
+        against the one physically measured model in the catalogue: 95.0 × 80.6
+        × 141.0 against 140 mm of height and "a bit under 100" of length.
+
+        **Corners, not lengths.** The matrices rotate as well as move, and a
+        rotated box has to be rebuilt from points; a rotated piece therefore
+        yields a slightly larger box than the piece really is, which is the
+        error this trades for not reading the mesh. Millimetres on a toy — and
+        it errs upwards.
+
+        Returns None when the file cannot be made to answer: no block, a piece
+        `--info` did not measure, or — the case this exists for — **nothing
+        touching anything at all**, which is Studio's untouched default of laying
+        the pieces out in a row and means nobody ever assembled this file. A
+        caller needs that told apart from a measurement, because the honest
+        response to it is to ask a human. There is deliberately no rule for
+        "partly assembled": the chest whose lid is not on it is half a group and
+        distinguishing it from a whole one would take a threshold, which would
+        be a number invented here rather than found in the file.
+        """
+        try:
+            with zipfile.ZipFile(path) as zf:
+                if MODEL_SETTINGS not in zf.namelist():
+                    return None
+                root = ET.fromstring(zf.read(MODEL_SETTINGS))
+        except (OSError, zipfile.BadZipFile, ET.ParseError):
+            return None
+
+        items = root.find("assemble")
+        if items is None:
+            return None
+
+        # `--info` prints one block per object in ascending id order, and that
+        # ordering is the only link between a block and the id the assembly
+        # names — it prints no id, no name, nothing else to match on. Verified
+        # against every file in the catalogue by facet count, which the blocks do
+        # carry. A mismatched count means the pairing cannot be trusted and the
+        # measurement is refused rather than guessed at.
+        ids = sorted(int(o.get("id")) for o in root.findall("object") if (o.get("id") or "").isdigit())
+        if len(ids) != len(objects):
+            return None
+        boxes = dict(zip(ids, objects))
+
+        placed: list[tuple[list[float], list[float], float]] = []
+        for item in items.findall("assemble_item"):
+            box = boxes.get(int(item.get("object_id") or -1)) if (item.get("object_id") or "").isdigit() else None
+            if box is None or box.file_min is None or box.file_max is None:
+                return None
+
+            matrix = [float(v) for v in (item.get("transform") or "").split()]
+            if len(matrix) != 12:
+                return None
+
+            lo = [float("inf")] * 3
+            hi = [float("-inf")] * 3
+            for corner in itertools.product(*zip(box.file_min, box.file_max)):
+                for axis in range(3):
+                    placement = sum(
+                        matrix[axis * 3 + n] * corner[n] for n in range(3)
+                    ) + matrix[9 + axis]
+                    lo[axis] = min(lo[axis], placement)
+                    hi[axis] = max(hi[axis], placement)
+            # Material, not the box: the box of a hollow shell says how much room
+            # a piece takes, and what is wanted here is which cluster *is* the
+            # toy. Falls back to the box only where the binary reported no volume.
+            volume = box.volume_mm3 or max(
+                (hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]), 0.0
+            )
+            placed.append((lo, hi, volume))
+
+        group = self._glued_group(placed)
+        if group is None:
+            return None
+
+        lo = [min(placed[i][0][axis] for i in group) for axis in range(3)]
+        hi = [max(placed[i][1][axis] for i in group) for axis in range(3)]
+
+        # Scaled at the end rather than on the way in: the matrices are written
+        # in the file's own coordinates, so a factor applied to the corners would
+        # have to be applied to the translations too. Uniform scaling about the
+        # origin makes the two identical, and doing it once here says so.
+        return Assembly(
+            size_x=round((hi[0] - lo[0]) * factor, 3),
+            size_y=round((hi[1] - lo[1]) * factor, 3),
+            size_z=round((hi[2] - lo[2]) * factor, 3),
+            part_count=len(group),
+        )
+
+    # How far apart two placed boxes may be and still count as touching.
+    #
+    # Not float noise — a fit clearance. Mating printed parts are modelled with
+    # a tenth or two of a millimetre of air between them, because a peg drawn
+    # flush with its hole does not go in once both have been printed. Half a
+    # millimetre covers that with room to spare and is nowhere near anything it
+    # could merge by mistake: the closest thing this must *not* absorb is an
+    # accessory parked beside a model, and that is ten millimetres away.
+    #
+    # It decides real cases. Two pieces of the German shepherd sit between 0.1
+    # and 0.5 mm off its body — at a tighter tolerance they read as loose extras
+    # and the dog measures 75.9 mm instead of 79.7.
+    TOUCH_TOLERANCE_MM = 0.5
+
+    @classmethod
+    def _glued_group(
+        cls, placed: list[tuple[list[float], list[float], float]]
+    ) -> list[int] | None:
+        """Indices of the pieces that make up the model, or None if none do.
+
+        Pieces are grouped by whether their placed boxes meet, and the group
+        holding the most material wins. A single-piece file is trivially its own
+        group and takes this path like any other.
+
+        None when **every** group is a lone piece and there is more than one of
+        them: nothing is glued to anything, so the placements are Studio's
+        untouched row rather than an assembly. Deliberately the only rejection —
+        see _assembly() on why "partly assembled" gets no rule.
+        """
+        if not placed:
+            return None
+
+        parent = list(range(len(placed)))
+
+        def root(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i, j in itertools.combinations(range(len(placed)), 2):
+            a, b = placed[i], placed[j]
+            if all(
+                a[0][axis] <= b[1][axis] + cls.TOUCH_TOLERANCE_MM
+                and b[0][axis] <= a[1][axis] + cls.TOUCH_TOLERANCE_MM
+                for axis in range(3)
+            ):
+                parent[root(i)] = root(j)
+
+        groups: dict[int, list[int]] = {}
+        for i in range(len(placed)):
+            groups.setdefault(root(i), []).append(i)
+
+        if len(placed) > 1 and all(len(members) == 1 for members in groups.values()):
+            return None
+
+        return max(groups.values(), key=lambda members: sum(placed[i][2] for i in members))
 
     @staticmethod
     def _info_blocks(stdout: str) -> list[dict[str, str]]:
@@ -419,7 +596,20 @@ class OrcaSlicerEngine(SlicerEngine):
             volume_mm3=cls._maybe_float(values.get("volume"), factor ** 3),
             facet_count=cls._maybe_int(values.get("number_of_facets")),
             manifold=cls._maybe_bool(values.get("manifold")),
+            # Unrounded and unscaled, unlike the lengths above: these are what
+            # the assembly is built out of, and rounding them would move a piece
+            # rather than merely describe it imprecisely.
+            file_min=cls._corner(values, "min"),
+            file_max=cls._corner(values, "max"),
         )
+
+    @staticmethod
+    def _corner(values: dict[str, str], edge: str) -> tuple[float, float, float] | None:
+        """`min_x`/`max_x`… as a point, or None when `--info` did not print them."""
+        try:
+            return tuple(float(values[f"{edge}_{axis}"]) for axis in "xyz")
+        except (KeyError, ValueError):
+            return None
 
     @staticmethod
     def _maybe_float(raw: str | None, factor: float = 1.0) -> float | None:

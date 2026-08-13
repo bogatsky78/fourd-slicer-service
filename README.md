@@ -110,7 +110,8 @@ Both return a `model` block describing the geometry:
     ],
     "object_count": 4,
     "total_volume_mm3": 22965.693,
-    "size_x": 41.632, "size_y": 43.921, "size_z": 48.986
+    "size_x": 41.632, "size_y": 43.921, "size_z": 48.986,
+    "assembly": {"size_x": 41.632, "size_y": 43.921, "size_z": 48.986, "part_count": 4}
   }
 }
 ```
@@ -122,6 +123,14 @@ individually plus their combined volume, never the extent of their arrangement
 on the print bed. The top-level `size_*` is the largest single object, for
 callers that want one number. Sizes have the request's `scale` applied; volume
 scales with its cube.
+
+**`assembly` answers the other question**: how big the model is once its pieces
+are glued together, which for anything laid out across plates is nothing like its
+largest piece — one retriever's biggest piece is 81 mm tall where the dog is 141.
+It is `null` when the file does not say so, and that must not be read as zero or
+filled in with a stand-in.
+
+**Every field, its unit, and what an empty one is claiming: [`API.md`](API.md).**
 
 ## Adding a slicer
 

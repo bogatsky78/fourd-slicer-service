@@ -69,10 +69,45 @@ class ModelObject:
     volume_mm3: float | None = None
     facet_count: int | None = None
     manifold: bool | None = None
+    # The same box as two corners rather than three lengths, in the file's own
+    # coordinates and **without** the request's scale — unlike size_* above,
+    # which carry it. Both differences are deliberate: an assembly is placed by
+    # pushing these corners through matrices written in those same unscaled
+    # coordinates, and a piece is not centred on its own origin (one of Stay
+    # Golden's runs 2.8..37.6 in x), so a box reconstructed from the lengths
+    # alone would land somewhere the part is not.
+    #
+    # Not published. Where a piece sits in its own frame is the file's private
+    # business and answers nothing a caller asked.
+    file_min: tuple[float, float, float] | None = None
+    file_max: tuple[float, float, float] | None = None
 
     @property
     def longest_edge(self) -> float:
         return max(self.size_x, self.size_y, self.size_z)
+
+
+@dataclass
+class Assembly:
+    """The model as one object: the toy that stands on the shelf once its pieces
+    are glued together, as opposed to the pieces that come off the bed.
+
+    A laid-out model has no size anywhere in it — `--info` measures each piece in
+    its own coordinates, and how they sit on the plates is a fact about
+    compositing, not about the toy. What does say it is the file's `<assemble>`
+    block: where the author placed every piece relative to every other. Running
+    the pieces' boxes through those placements is the only answer in the file to
+    "how big is the thing the customer receives".
+
+    Absent — `None` rather than a number — when the file carries no such block.
+    A caller needs to be able to tell "we could not measure it" from a
+    measurement, because the honest response to the first is to ask a human.
+    """
+
+    size_x: float
+    size_y: float
+    size_z: float
+    part_count: int
 
 
 @dataclass
@@ -98,6 +133,7 @@ class ModelInfo:
     """
 
     objects: list[ModelObject] = field(default_factory=list)
+    assembly: Assembly | None = None
 
     @property
     def object_count(self) -> int:
@@ -124,16 +160,27 @@ class ModelInfo:
     def size_z(self) -> float | None:
         return self.largest.size_z if self.largest else None
 
+    # What an object publishes. Listed rather than taken from `asdict`, because
+    # ModelObject also carries the corners the assembly is built from, and those
+    # are coordinates in a frame the caller has no way to interpret.
+    OBJECT_FIELDS = ("size_x", "size_y", "size_z", "volume_mm3", "facet_count", "manifold")
+
     def to_payload(self) -> dict:
         """Serialised by hand because `dataclasses.asdict` cannot see properties,
         and the aggregates are the part most callers actually read."""
         return {
-            "objects": [dataclasses.asdict(o) for o in self.objects],
+            "objects": [
+                {name: getattr(o, name) for name in self.OBJECT_FIELDS}
+                for o in self.objects
+            ],
             "object_count": self.object_count,
             "total_volume_mm3": self.total_volume_mm3,
             "size_x": self.size_x,
             "size_y": self.size_y,
             "size_z": self.size_z,
+            # Null means the file does not say, and must not be read as zero or
+            # quietly replaced with the largest piece — see Assembly.
+            "assembly": dataclasses.asdict(self.assembly) if self.assembly else None,
         }
 
 

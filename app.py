@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from engines import registry
 from engines.base import EngineUnavailable, SliceFailed, SliceRequest
 
-app = FastAPI(title="FourD Slicer Service", version="1.2")
+app = FastAPI(title="FourD Slicer Service", version="1.3")
 
 WORKDIR_ROOT = os.environ.get("SLICER_WORKDIR", "/work")
 
