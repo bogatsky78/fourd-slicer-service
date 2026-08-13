@@ -1,6 +1,6 @@
 # API reference
 
-Everything the service accepts and everything it answers, for version **1.3**.
+Everything the service accepts and everything it answers, for version **1.4**.
 
 A running instance serves the machine-readable schema at `/openapi.json` and a
 browsable form of it at `/docs`; the endpoint and parameter tables below are
@@ -58,6 +58,22 @@ anything that only needs to know how big something is.
 | `filament_profiles` | string | no | `""` | `;`-separated profile names, one per slot. |
 | `scale` | number | no | `1.0` | See the warning about it below. |
 | `plate` | integer | no | `0` | `0` slices the whole file; a plate number slices only that plate. |
+| `brim` | boolean | no | `false` | Off by default, so the grams describe the part and not a skirt around it. See below. |
+
+**The brim is off unless you ask for it.** Whatever the file's own `brim_type`
+says, the engine is told `no_brim` — the default answer is the weight of the
+part alone. Two reasons, and either is enough. A brim is material the shop does
+not extrude: the printer holds its parts without one, and cutting a brim off a
+finished part costs minutes of knife work each, so a weight that includes one
+prices a print nobody makes. And on some plates it is the only way to get a
+number at all — four dowels of 12–100 mm³ at 27–71k triangles apiece kill the
+run inside `Generating skirt & brim`, intermittently, under the unhelpful name
+`std::bad_alloc`.
+
+Measured cost on files whose own setting is `auto_brim`: **none.** The same
+plate weighs 116.64 g with the brim and 116.64 g without; another weighs 18.47 g
+against 18.48 g. Where the engine would have laid a brim, the difference is that
+brim's own grams. Pass `brim=true` to get the file's behaviour back.
 
 **Pass a `machine_profile` or do not trust the grams.** Without one the engine
 slices on the settings the file's author saved into it, which for a Bambu AMS
@@ -282,6 +298,9 @@ and is reported in every response.
 - **1.2** added `plates[]`, `max_plate_filaments` and `filament_changes`, and
   started slicing a plate at a time.
 - **1.3** added `model.assembly`.
+- **1.4** turned the brim off by default and added `brim` to ask for it back.
+  This one **changes numbers a caller already had**: a file the engine would
+  have brimmed now weighs its own grams and no more.
 
 Fields are added, not repurposed. The one thing a caller must handle is the
 difference between a field being **absent** — an older service that has never

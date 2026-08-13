@@ -226,6 +226,7 @@ class SliceRequest:
     filament_profiles: list[str] = field(default_factory=list)
     scale: float = 1.0
     plate: int = 0  # 0 = all plates
+    brim: bool = False  # see OrcaSlicerEngine._run_slice for why off is the default
 
 
 class EngineUnavailable(RuntimeError):
