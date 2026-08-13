@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from engines import registry
 from engines.base import EngineUnavailable, SliceFailed, SliceRequest
 
-app = FastAPI(title="FourD Slicer Service", version="1.3")
+app = FastAPI(title="FourD Slicer Service", version="1.4")
 
 WORKDIR_ROOT = os.environ.get("SLICER_WORKDIR", "/work")
 
@@ -46,6 +46,7 @@ async def slice_model(
     filament_profiles: str = Form(""),
     scale: float = Form(1.0),
     plate: int = Form(0),
+    brim: bool = Form(False),
 ) -> dict:
     engine = _engine(code)
 
@@ -63,6 +64,7 @@ async def slice_model(
             filament_profiles=[p for p in filament_profiles.split(";") if p],
             scale=scale,
             plate=plate,
+            brim=brim,
         )
         try:
             result = engine.slice(request, workdir)

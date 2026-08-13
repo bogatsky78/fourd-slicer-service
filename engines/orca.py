@@ -318,6 +318,32 @@ class OrcaSlicerEngine(SlicerEngine):
             "--outputdir", workdir,
             "--export-3mf", output_name,
         ]
+        if not request.brim:
+            # **The brim is off by default, and that is a decision, not a
+            # shortcut.** The shop does not print with one: this printer holds
+            # its parts down well enough without, and cutting a brim off a
+            # finished part is minutes of knife work per part. A weight that
+            # includes material nobody extrudes prices the wrong print.
+            #
+            # It also happens to be the only way some plates slice at all. The
+            # hydra's plate 6 carries four dowels of 12–100 mm³ at 27–71k
+            # triangles each; a 5 mm brim around a part a few millimetres wide
+            # closes on itself, and offsetting outlines that dense blows up
+            # inside `Generating skirt & brim` — as `std::bad_alloc` on 957 MB
+            # of resident memory with 30 GB free, which reads as a broken model
+            # rather than as a brim. It is intermittent, roughly one run in
+            # twelve succeeding, which is what makes it so hard to place; the
+            # engine says nothing beyond the two words unless it is run with
+            # `--debug 5 --logfile`, and only the file gets the 8.6k lines that
+            # name the stage. Wider is worse (10 mm never slices, 1 mm
+            # sometimes does), off is 10 runs out of 10.
+            #
+            # Measured cost of switching it off, on files whose own setting is
+            # `auto_brim`: none. Plate 4 of the hydra weighs 116.64 g either
+            # way, plate 1 weighs 18.47 g against 18.48 g. Where the engine
+            # would have laid a brim the difference is that brim's own grams,
+            # which is exactly what the shop wants left out.
+            argv.append("--brim-type=no_brim")
         if request.machine_profile and request.process_profile:
             argv += [
                 "--load-settings",
