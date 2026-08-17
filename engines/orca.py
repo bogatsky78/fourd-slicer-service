@@ -49,6 +49,15 @@ PRIME_TOWER_FEATURE = ";TYPE:Prime tower"
 # reports as exit status 154 (256 - 102).
 GCODE_OUTSIDE_BED = -102
 
+# And it refuses the plate before slicing it — as exit status 206 — when nothing
+# on the plate is *fully* inside the bed. The two are one problem seen from two
+# distances: this one is the objects as the file lays them out, `-102` is the
+# toolpaths that came out of them, which is why a prime tower we placed
+# ourselves can only ever show up as the latter. Its message says "empty or has
+# no object fully inside", because the binary cannot tell those apart at that
+# point — the file can, and `_plate_has_objects()` asks it.
+PLATE_NOT_INSIDE = -50
+
 
 @dataclasses.dataclass
 class _Remedy:
@@ -230,20 +239,33 @@ class OrcaSlicerEngine(SlicerEngine):
         # A refusal is not always about the model. A prime tower placed for the
         # author's bed hangs off ours; a file's object labels can be more than
         # the binary can follow. Both are worth one more run with that one thing
-        # changed, and both are reported rather than done quietly.
+        # changed, and both are reported rather than done quietly. And a refusal
+        # is not always about anything: past the named remedies the plate is
+        # simply run again, because some of them come and go — see _remedy().
         adjustments: list[str] = []
         tried: list[str] = []
-        while not output_path and len(tried) < len(self.REMEDIES):
+        while not output_path and len(tried) < len(self.REMEDIES) + self.RETRIES:
             remedy = self._remedy(request, source, workdir, plate, proc, tried)
             if not remedy:
                 break
             extra += remedy.argv
             tried.append(remedy.kind)
-            adjustments.append(remedy.note)
+            # A plain retry says nothing on its own; what is worth reporting is
+            # how many of them it took, and that is only known once one worked.
+            if remedy.note:
+                adjustments.append(remedy.note)
             if remedy.sticky and learned is not None:
                 learned += remedy.argv
             proc, output_path = self._run_slice(
                 request, source, workdir, plate, extra=extra
+            )
+
+        retries = tried.count("retry")
+        if output_path and retries:
+            adjustments.append(
+                f"the engine refused this plate {retries} "
+                f"time{'s' if retries > 1 else ''} for no reason it would name, "
+                f"and sliced it unchanged on run {retries + 1}"
             )
 
         if not output_path:
@@ -265,9 +287,13 @@ class OrcaSlicerEngine(SlicerEngine):
         shutil.rmtree(workdir, ignore_errors=True)
         return usage, self._log(proc)
 
-    # Each remedy is one thing worth changing about a refused plate, tried at
-    # most once and in this order.
+    # Each named remedy is one thing worth changing about a refused plate,
+    # tried at most once and in this order.
     REMEDIES = ("tower", "labels")
+
+    # How many times a plate refused for no nameable reason is simply run
+    # again, unchanged. See _remedy() for why this number and not a smaller one.
+    RETRIES = 6
 
     def _remedy(
         self,
@@ -279,10 +305,26 @@ class OrcaSlicerEngine(SlicerEngine):
         tried: list[str],
     ) -> "_Remedy | None":
         """The next thing worth changing about a plate the binary refused."""
-        if "tower" not in tried:
-            moved = self._tower_shift(request, source, workdir, plate)
-            if moved:
-                return moved
+        code = self._result_json(workdir).get("return_code")
+        if code == GCODE_OUTSIDE_BED:
+            # Something is over the edge. Ours to fix only when it is the prime
+            # tower, which we placed; anything else is the file's own layout, and
+            # the file is what the shop prints. So this is where a refusal stops
+            # being worth another run: the same argv on the same geometry lands
+            # outside the same bed every time, and six retries of it are six
+            # slices spent to reach the same word.
+            if "tower" not in tried:
+                moved = self._tower_shift(request, source, workdir, plate)
+                if moved:
+                    return moved
+            raise self._off_bed(request, source, workdir, plate, proc)
+
+        if code == PLATE_NOT_INSIDE and self._plate_has_objects(source, plate):
+            # The same verdict one step earlier, and only when the file says this
+            # plate carries objects — otherwise the binary's other reading of
+            # this code is the right one, the plate is simply empty, and that is
+            # not something to answer with a sentence about the bed.
+            raise self._off_bed(request, source, workdir, plate, proc)
 
         if "labels" not in tried:
             # `exclude_object` writes the markers a printer uses to skip one
@@ -299,6 +341,36 @@ class OrcaSlicerEngine(SlicerEngine):
                     argv=["--exclude-object=0"],
                     note="object labels switched off, which the file's own ids broke",
                 )
+
+        # Last, and only once nothing above has a name for what went wrong:
+        # run the very same command again.
+        #
+        # **Some refusals come and go.** The same file, the same plate, the same
+        # argv: the owl's plate 5 dies inside tree supports on `Not
+        # precalculated Placeable areas requested` on three runs out of eight,
+        # and slices the other five to the same 49.40 g. There is nothing to fix
+        # in the request, because the request that fails is the request that
+        # works. The message is not even a tell: those `Error:` lines are in the
+        # log of the successful runs too, twenty-five of them, and the run ends
+        # in a G-code file anyway.
+        #
+        # This sits *after* the named remedies and not instead of them, which is
+        # the whole discipline of it. The hydra's plate 6 was flaky the same way
+        # — one run in twelve — and the right answer there was not persistence
+        # but the cause: the brim. A retry that ran first would have found that
+        # plate a number eventually and buried the reason it needed one.
+        #
+        # **The cost is bounded and paid only on refusals.** Six is chosen from
+        # the owl: at its measured rate, a plate is left without a number about
+        # once in a thousand analyses instead of once in three, which is what it
+        # takes for `analyze --all` to stop being a coin toss. A plate that
+        # never slices still refuses — six runs slower, which on a refusal of
+        # seconds to a couple of minutes is a price worth the catalogue not
+        # having holes in it.
+        if tried.count("retry") < self.RETRIES:
+            # Nothing to change, and no sentence yet: how many runs it took is
+            # only worth reporting once one of them works.
+            return _Remedy(kind="retry", argv=[], note="")
         return None
 
     def _run_slice(
@@ -1091,6 +1163,120 @@ class OrcaSlicerEngine(SlicerEngine):
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
         return min(xs), max(xs), min(ys), max(ys)
+
+    def _bed_limits(
+        self, machine_profile: str | None
+    ) -> tuple[float, float, float | None] | None:
+        """The bed as the room a part has to fit inside, in millimetres.
+
+        The extent of `printable_area` rather than the machine's advertised size:
+        the U1 is sold as 270 × 270 × 270 and reaches from 0.5 to 270.5, which is
+        the same 270 mm shifted half a millimetre off the corner. Height is its
+        own key and may be absent, in which case the two other axes are still
+        worth comparing — a part refused for being 285 mm wide is answered
+        whether or not the profile says how tall the machine is.
+        """
+        box = self._bed_box(machine_profile)
+        if not box:
+            return None
+
+        raw = self._profile_setting(machine_profile, "printable_height") if machine_profile else None
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        try:
+            height = float(raw)
+        except (TypeError, ValueError):
+            height = None
+
+        return round(box[1] - box[0], 3), round(box[3] - box[2], 3), height
+
+    def _off_bed(
+        self, request: SliceRequest, source: str, workdir: str, plate: int, proc
+    ) -> SliceFailed:
+        """The refusal for a plate that hangs off the bed, said in parts and
+        millimetres.
+
+        Worth the extra `--info` run this costs, because the two answers lead
+        somewhere different. A part **larger than the bed** cannot be printed by
+        this machine at all, and the shop's move is a different printer or a
+        different file; a plate whose parts all fit but which is **laid out past
+        the edge** is a file to re-arrange. "It did not fit" tells nobody which
+        of the two they are looking at.
+
+        Sizes are compared as the file states them, with no rotation and no
+        sorting of the sides. The plate is printed exactly as its author laid it
+        out, so a part that fits only when turned does not fit.
+        """
+        bed = self._bed_limits(request.machine_profile)
+        oversize = self._oversize(source, bed) if bed else []
+
+        if oversize:
+            detail = "; ".join(oversize)
+        elif bed:
+            detail = (
+                f"no part is larger than the bed ({self._bed_words(bed)}), "
+                "so the plate is laid out past its edge"
+            )
+        else:
+            # No profile, or one that does not state its printable area: the
+            # refusal is still the engine's own and still final, but naming the
+            # part would mean inventing the bed to compare it against. This is
+            # the one branch that quotes the binary, because without a bed to
+            # measure against its sentence is all there is — and its sentence is
+            # worth quoting only there: it says "empty or nothing fully inside",
+            # which next to millimetres of ours reads as a second, wrong
+            # diagnosis. The full log travels in `log` either way.
+            said = self._reason(workdir).lstrip(": ")
+            detail = "the machine profile does not say how big the bed is, so the part cannot be named"
+            if said:
+                detail += f" (engine: {said})"
+
+        return SliceFailed(
+            f"{self.code}: the print does not fit the bed"
+            + (f" on plate {plate}" if plate else "")
+            + f": {detail}",
+            exit_code=proc.returncode,
+            log=self._log(proc),
+            reason=SliceFailed.OFF_BED,
+        )
+
+    def _plate_has_objects(self, source: str, plate: int) -> bool:
+        """Does the file put anything on this plate?
+
+        Plate 0 is the whole-file request a single-plate file still goes through
+        (see `_plates_to_slice`), and the file numbers that plate 1. A file whose
+        layout cannot be read answers False: "we could not tell" must not become
+        a statement about the bed.
+        """
+        plates, _ = self._layout(source)
+        return bool(plates.get(plate or 1))
+
+    def _oversize(self, source: str, bed: tuple[float, float, float | None]) -> list[str]:
+        """Each part that is larger than the bed, on each axis it is larger on.
+
+        Numbered rather than named because `--info` prints no names, and the
+        number is the position in the `objects` list the caller already has.
+        """
+        try:
+            objects = self._inspect_file(source).objects
+        except SliceFailed:
+            return []
+
+        found = []
+        for number, obj in enumerate(objects, start=1):
+            for axis, size, limit in (
+                ("x", obj.size_x, bed[0]),
+                ("y", obj.size_y, bed[1]),
+                ("z", obj.size_z, bed[2]),
+            ):
+                if limit is not None and size > limit:
+                    found.append(f"part {number} is {size} mm on {axis} against {limit}")
+        return found
+
+    @staticmethod
+    def _bed_words(bed: tuple[float, float, float | None]) -> str:
+        sides = [bed[0], bed[1]] + ([bed[2]] if bed[2] is not None else [])
+        return " × ".join(f"{side}" for side in sides) + " mm"
 
     @staticmethod
     def _feature_box(gcode_path: str | None, feature: str) -> tuple[float, ...] | None:

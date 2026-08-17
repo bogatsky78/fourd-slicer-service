@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from engines import registry
 from engines.base import EngineUnavailable, SliceFailed, SliceRequest
 
-app = FastAPI(title="FourD Slicer Service", version="1.4")
+app = FastAPI(title="FourD Slicer Service", version="1.6")
 
 WORKDIR_ROOT = os.environ.get("SLICER_WORKDIR", "/work")
 
@@ -73,7 +73,7 @@ async def slice_model(
         except SliceFailed as exc:
             raise HTTPException(
                 status_code=422,
-                detail={"message": str(exc), "exit_code": exc.exit_code, "log": exc.log},
+                detail=_refusal(exc),
             ) from exc
 
         payload = dataclasses.asdict(result)
@@ -121,12 +121,29 @@ async def inspect_model(
         except SliceFailed as exc:
             raise HTTPException(
                 status_code=422,
-                detail={"message": str(exc), "exit_code": exc.exit_code, "log": exc.log},
+                detail=_refusal(exc),
             ) from exc
 
         return {"engine": engine.code, "engine_version": engine.version(), "model": info.to_payload()}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _refusal(exc: SliceFailed) -> dict:
+    """What a 422 carries.
+
+    `reason` is present on every refusal and null on most of them, so a caller
+    can branch on it without first asking whether the field exists. A name means
+    the refusal is a fact about the model worth storing — `off_bed` is one — and
+    null means the slicer simply said no, which only the sentence and the log
+    tail can describe.
+    """
+    return {
+        "message": str(exc),
+        "reason": exc.reason,
+        "exit_code": exc.exit_code,
+        "log": exc.log,
+    }
 
 
 def _engine(code: str):

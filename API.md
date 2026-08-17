@@ -1,6 +1,6 @@
 # API reference
 
-Everything the service accepts and everything it answers, for version **1.4**.
+Everything the service accepts and everything it answers, for version **1.5**.
 
 A running instance serves the machine-readable schema at `/openapi.json` and a
 browsable form of it at `/docs`; the endpoint and parameter tables below are
@@ -171,6 +171,13 @@ slice at all — moving a purge tower back onto the bed, for instance. It is
 reported rather than done quietly, because it means the file describes a print
 this machine cannot run as the author laid it out.
 
+A plate that took more than one run of the engine to slice says so here too,
+with the count. Some refusals come and go: the same plate, the same arguments,
+refused three runs out of eight and sliced to the same weight on the other five.
+The service simply runs it again — see the note on stubbornness below — and the
+line is there so that a price which took six attempts to obtain does not look as
+settled as one that sliced first time.
+
 **Renumbering, and why `material` and `color` come from the file.** A file's
 extruder number is a palette slot, not a print head: an assembly numbers its
 colours 1..13 and prints one plate at a time, and the engine — which reads those
@@ -280,11 +287,37 @@ service rather than found in the file.
 | `503` | The engine exists in the registry but its binary is not in this image | `detail`: string |
 | `422` | The slice failed, **or** a request field failed validation | See below |
 
-A failed slice returns `detail` as an object: `message`, `exit_code`, and `log` —
-the tail of **both** output streams. Both, because the engine writes progress to
-stdout and the reason for a refusal to stderr, and reading only the first is how
-`return -51` looked like a mystery for a week. Where the engine wrote its own
-verdict, that sentence is in `message` along with the plate it was on.
+A failed slice returns `detail` as an object: `message`, `reason`, `exit_code`,
+and `log` — the tail of **both** output streams. Both, because the engine writes
+progress to stdout and the reason for a refusal to stderr, and reading only the
+first is how `return -51` looked like a mystery for a week. Where the engine
+wrote its own verdict, that sentence is in `message` along with the plate it was
+on.
+
+**`reason` is present on every refusal and null on most of them.** A name means
+the refusal is a fact about the model, worth storing against the product and
+worth acting on; null means the slicer simply said no, and only the sentence and
+the log describe it. One name exists today:
+
+| `reason` | What it means | What the caller can do |
+|---|---|---|
+| `off_bed` | The print does not fit the bed of the machine it was sliced for — a part is larger than the bed, or the plate is laid out past its edge | Nothing that involves trying again: a different printer, or a different file |
+
+`message` says which of the two it is, and in millimetres: `part 1 is 68.837 mm
+on y against 60.0`, or `no part is larger than the bed (270.0 × 270.0 × 270.05
+mm), so the plate is laid out past its edge`. Parts are numbered by their
+position in the `objects` list of the `model` block. Sides are compared as the
+file states them: the plate is printed as its author laid it out, so a part that
+would fit rotated does not fit.
+
+**A 422 with no `reason` means the engine refused the same plate seven times**,
+not once. Past the fixes it has names for, the service runs a refused plate again
+— up to six more times — because some of these refusals are intermittent. Two
+consequences worth planning for: a slice that fails now takes several times
+longer to say so, and a timeout on the caller's side has to allow for it. A file
+that cannot be sliced at all still cannot be sliced; it only takes longer to hear
+that. A **named** refusal is the exception and arrives at once: `off_bed` is
+deterministic, so repeating it would only spend slices to reach the same word.
 
 A malformed request instead returns FastAPI's own validation shape, `detail` as
 a list of `{loc, msg, type}`.
@@ -301,6 +334,12 @@ and is reported in every response.
 - **1.4** turned the brim off by default and added `brim` to ask for it back.
   This one **changes numbers a caller already had**: a file the engine would
   have brimmed now weighs its own grams and no more.
+- **1.5** runs a refused plate again instead of giving up on it, and says in
+  `plates[].adjustments` when it had to. No field changed shape; what changed is
+  how long a failure takes to arrive.
+- **1.6** added `reason` to the 422 body and the first name in it, `off_bed`,
+  which also arrives without the retries of 1.5. Callers that only read `message`
+  are unaffected.
 
 Fields are added, not repurposed. The one thing a caller must handle is the
 difference between a field being **absent** — an older service that has never

@@ -70,6 +70,16 @@ is that boundary, and it absorbs three problems so the caller sees none of them:
   `std::bad_alloc`, as a segfault in the brim, or as a bare `-100`, none of which
   mentions a number out of range. The service renumbers each plate's colours into
   the heads the machine has and numbers them back in the answer.
+- **Some refusals come and go.** The same plate, sliced with the same arguments,
+  is refused on some runs and produces the same weight on others — one file in
+  the catalogue fails roughly three runs in eight. Past the fixes it has names
+  for, the service runs a refused plate again rather than reporting a number as
+  unobtainable when the next attempt would have had it.
+- **Some refusals are about the model, and saying so is the answer.** A print
+  larger than the bed, or laid out past its edge, is refused with a code that
+  mentions no beds. The service compares the parts against the printable area of
+  the profile it sliced for, names the part and the millimetres, and answers at
+  once instead of retrying something deterministic.
 - **Every slicer differs.** CLI dialect, input requirements and result format all
   vary. Engines normalise those away behind one contract.
 
@@ -91,6 +101,13 @@ failed — `detail` carries `exit_code`, the tail of **both** output streams
 (the reason for a refusal goes to stderr while progress goes to stdout) and, when
 the engine wrote one, its own sentence for what went wrong and which plate it was
 on.
+
+`detail.reason` names the refusals that are facts about the model rather than
+about the run, and is null for the rest. Today there is one, `off_bed`.
+
+An unnamed `422` means the plate was refused on every attempt, retries included,
+so budget a client timeout for the slow case rather than the typical one. A named
+one arrives without them, having nothing to gain from another run.
 
 Slicing is synchronous and CPU-heavy: roughly 20 seconds for a multi-colour
 model, and a plate at a time for a file laid out across several — an eleven-plate

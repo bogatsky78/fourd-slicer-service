@@ -234,10 +234,30 @@ class EngineUnavailable(RuntimeError):
 
 
 class SliceFailed(RuntimeError):
-    def __init__(self, message: str, exit_code: int | None = None, log: str | None = None):
+    """A refusal, with an optional name for what kind of refusal it is.
+
+    `reason` is for the few refusals a caller can *act* on, and it is deliberately
+    not filled in for the rest: a sentence and a log tail are all anyone can do
+    with a segfault, while "this plate does not fit the bed" is a fact about the
+    product that has to survive the wire as something other than prose. It stays
+    None unless a refusal has earned a name — an unnamed one means only that the
+    slicer said no.
+    """
+
+    #: The plate hangs off the bed and no argument of ours would change that.
+    OFF_BED = "off_bed"
+
+    def __init__(
+        self,
+        message: str,
+        exit_code: int | None = None,
+        log: str | None = None,
+        reason: str | None = None,
+    ):
         super().__init__(message)
         self.exit_code = exit_code
         self.log = log
+        self.reason = reason
 
 
 class SlicerEngine(abc.ABC):
