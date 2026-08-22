@@ -741,6 +741,15 @@ class OrcaSlicerEngine(SlicerEngine):
         "single_extruder_multi_material": None,
         "extruder_printable_area": [],
         "extruder_printable_height": [],
+        # Which head the machine calls its primary one, 1-based. A file written
+        # on a two-head Bambu H2C says 2; on a one-head machine that is a head
+        # which does not exist, and the binary dies with SIGSEGV before it writes
+        # a single line — on every plate, under `--debug 5`, and run by hand past
+        # this service alike. `None` rather than a number, so a profile that says
+        # nothing about the concept (the U1: a tool changer has no primary head)
+        # keeps the file's value, and every gram already measured against it
+        # stays exactly where it was.
+        "master_extruder_id": None,
     }
 
     def _machine_overrides(self, machine_profile: str | None) -> dict:
