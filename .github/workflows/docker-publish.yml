@@ -69,4 +69,9 @@ jobs:
             curl -fsS http://127.0.0.1:8000/health && break || sleep 2
           done
           curl -fsS http://127.0.0.1:8000/engines | tee /dev/stderr | grep -q '"available":true'
+          # The renderer is a second thing that can be missing from a build —
+          # its numpy and pillow are installed separately from the engine, and
+          # without them the module does not import. A served schema that names
+          # the route proves both the import and the wiring.
+          curl -fsS http://127.0.0.1:8000/openapi.json | grep -q '"/render"'
           docker rm -f smoke

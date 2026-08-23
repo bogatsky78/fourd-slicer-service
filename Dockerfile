@@ -63,7 +63,7 @@ COPY --from=fetch-orca /build/squashfs-root /opt/engines/orca
 WORKDIR /opt/slicer
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
-COPY repair3mf.py app.py ./
+COPY repair3mf.py render.py app.py ./
 COPY engines ./engines
 
 # LC_ALL=C is the upstream AppRun workaround for unexpected locale data.

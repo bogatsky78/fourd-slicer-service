@@ -6,6 +6,7 @@ whatever is asking.
 """
 from __future__ import annotations
 
+import base64
 import dataclasses
 import os
 import shutil
@@ -13,10 +14,11 @@ import tempfile
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
+import render
 from engines import registry
 from engines.base import EngineUnavailable, SliceFailed, SliceRequest
 
-app = FastAPI(title="FourD Slicer Service", version="1.6")
+app = FastAPI(title="FourD Slicer Service", version="1.7")
 
 WORKDIR_ROOT = os.environ.get("SLICER_WORKDIR", "/work")
 
@@ -127,6 +129,74 @@ async def inspect_model(
         return {"engine": engine.code, "engine_version": engine.version(), "model": info.to_payload()}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+@app.post("/render")
+async def render_model(
+    model: UploadFile = File(...),
+    width: int = Form(900),
+    height: int = Form(900),
+    stage: str | None = Form(None),
+) -> dict:
+    """One picture of the model, and the name of where it came from.
+
+    **Not under `/engines/{code}/`**, unlike everything else that reads a model:
+    not one stage of the cascade touches a slicer binary. Two lift a picture the
+    designer put in the archive and the third draws the meshes; asking for an
+    engine would be asking for something that is then never used, and would
+    imply a choice of renderer that does not exist.
+
+    The stage travels with the image because it changes what the image *is* —
+    the designer's studio render, the designer's photograph of a print, or our
+    own untextured geometry — and only the caller can decide what to do with each.
+
+    Base64 rather than raw bytes with the stage in a header: every other response
+    from this service is JSON, and a caller that has already written a JSON
+    client should not need a second code path to fetch a picture. A 900x900 PNG
+    is a few hundred kilobytes, and a third on top of that is nothing next to the
+    3MF that was just uploaded to produce it.
+    """
+    width, height = _picture_size(width), _picture_size(height)
+
+    os.makedirs(WORKDIR_ROOT, exist_ok=True)
+    workdir = tempfile.mkdtemp(dir=WORKDIR_ROOT, prefix="render-")
+    try:
+        source = os.path.join(workdir, os.path.basename(model.filename or "model.3mf"))
+        with open(source, "wb") as fh:
+            shutil.copyfileobj(model.file, fh)
+
+        try:
+            picture = render.render(source, width, height, stage)
+        except render.RenderFailed as exc:
+            raise HTTPException(status_code=422, detail={"message": str(exc), "stage": stage}) from exc
+
+        return {
+            "stage": picture.stage,
+            "assembled": picture.assembled,
+            "format": "png",
+            "width": picture.width,
+            "height": picture.height,
+            "bytes": len(picture.png),
+            "image_base64": base64.b64encode(picture.png).decode("ascii"),
+        }
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+#: Widest picture this will draw. Not a policy about what a shop should display —
+#: a guard on the one request parameter that costs memory quadratically, so a
+#: typo cannot ask for a 100000-pixel canvas and take the service down with it.
+MAX_PICTURE_PX = 4000
+
+
+def _picture_size(value: int) -> int:
+    if value < 16 or value > MAX_PICTURE_PX:
+        raise HTTPException(
+            status_code=422,
+            detail=f"picture size must be between 16 and {MAX_PICTURE_PX} pixels, got {value}",
+        )
+
+    return value
 
 
 def _refusal(exc: SliceFailed) -> dict:

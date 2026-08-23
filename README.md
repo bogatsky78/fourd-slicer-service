@@ -95,6 +95,7 @@ The full account of each, with the reasoning and the measurements, is in
 | `GET /engines/{code}/profiles` | Machine / process / filament profile names the engine knows. |
 | `POST /engines/{code}/slice` | multipart: `model`, optional `machine_profile`, `process_profile`, `filament_profiles` (`;`-separated), `scale`, `plate`. |
 | `POST /engines/{code}/inspect` | multipart: `model`, optional `scale`. Measures the model without slicing it — seconds rather than minutes, and no printer profile, because geometry does not depend on the machine. |
+| `POST /render` | multipart: `model`, optional `width`, `height`, `stage`. One PNG of the model, base64 in the JSON, with the name of the stage it came from. No engine in the path because no stage of it runs a slicer. |
 
 Errors: `404` unknown engine, `503` engine missing from the image, `422` slicing
 failed — `detail` carries `exit_code`, the tail of **both** output streams
@@ -115,6 +116,14 @@ assembly is minutes. Call it from a queue, not from a request a person is waitin
 on.
 `/inspect` is the cheap half — about 3 seconds — for callers that only need to
 know how big something is.
+
+`/render` answers a different question again: what the model **looks** like. It
+tries the designer's studio render, then the designer's photograph, then draws
+the meshes itself, and says which of the three it got — a caller has to know
+whether it is holding a photo of somebody's print or our own untextured
+geometry. The first two are milliseconds; drawing is 5 s for a million triangles
+and 38 s for eleven million, so it belongs in the same queue as slicing. See
+`API.md` for the cascade, the `assembled` flag and what frames the picture.
 
 Both return a `model` block describing the geometry:
 

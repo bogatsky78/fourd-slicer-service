@@ -1,6 +1,6 @@
 # API reference
 
-Everything the service accepts and everything it answers, for version **1.5**.
+Everything the service accepts and everything it answers, for version **1.7**.
 
 A running instance serves the machine-readable schema at `/openapi.json` and a
 browsable form of it at `/docs`; the endpoint and parameter tables below are
@@ -36,9 +36,11 @@ Nothing here is ever a percentage, a ratio or a machine-specific unit.
 | `GET` | `/engines/{code}/profiles` | instant | The machine / process / filament profile names that engine knows. |
 | `POST` | `/engines/{code}/slice` | ~20 s to minutes | Slice the model: what printing it consumes and how long it takes. |
 | `POST` | `/engines/{code}/inspect` | ~3 s | Measure the model without slicing it. |
+| `POST` | `/render` | instant to ~40 s | One picture of the model, and where the picture came from. |
 
 `{code}` is an engine code from `GET /engines` — `orca` in every image built so
-far.
+far. `/render` carries no engine in its path, and that is not an oversight: not
+one of the three things it can do involves a slicer binary.
 
 **Slicing is synchronous and CPU-heavy.** Roughly 20 seconds for a multi-colour
 model on one plate, and a plate at a time for a file laid out across several, so
@@ -101,6 +103,98 @@ therefore the ideal answer, not the engine's.
 machine.
 
 Returns `engine`, `engine_version` and the same `model` block a slice returns.
+
+### `POST /render`
+
+`multipart/form-data`:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `model` | file | required | The 3MF. |
+| `width` | int | `900` | Widest the picture may be, in pixels. 16 to 4000. |
+| `height` | int | `900` | Tallest the picture may be, in pixels. 16 to 4000. |
+| `stage` | string | *(cascade)* | Force one stage instead of walking the cascade. |
+
+The picture is fitted inside `width` x `height` keeping its shape, and is never
+enlarged past its own size — an embedded 680x510 thumbnail comes back at 680x510
+whatever box you ask for. The `width` and `height` in the response are what you
+actually got.
+
+```json
+{
+  "stage": "author_render",
+  "assembled": null,
+  "format": "png",
+  "width": 900,
+  "height": 675,
+  "bytes": 215627,
+  "image_base64": "iVBORw0KGgoAAA…"
+}
+```
+
+**Always PNG**, whatever was in the archive. The embedded pictures are webp, and
+Magento — the first caller — has no webp support at all: its `Image/` framework
+carries Gd2 and ImageMagick adapters and not one mention of the format.
+
+**Base64 rather than raw bytes with the stage in a header.** Every other
+response here is JSON, and fetching a picture should not need a second kind of
+client. The third it adds to the size is nothing beside the 3MF just uploaded to
+produce it.
+
+#### The cascade, and why `stage` matters
+
+Three sources, tried in this order, and they are not equally good:
+
+| `stage` | Where it comes from | What it is |
+|---|---|---|
+| `author_render` | `Auxiliaries/Model Pictures/render.webp` | The studio render the designer published with the model. Best there is, and free. |
+| `author_thumbnail` | `Auxiliaries/.thumbnails/thumbnail_middle.png` | The designer's photograph of a print. Always 680x510, and it sometimes carries an overlay the designer stamped on — one file in this catalogue has a crossed-out "AMS" badge across the corner. |
+| `geometry` | The meshes, drawn here | Our own render: flat-shaded, in the slot colours the project gives, on a plain ground. The only stage that works on a project somebody saved out of a slicer themselves. |
+
+In a catalogue of 26 MakerWorld files, 14 had `render.webp` and all 26 had
+`thumbnail_middle.png`. A project exported from OrcaSlicer out of an STL has
+**neither**, nor any `Auxiliaries/` at all — the third stage is not a fallback
+for those, it is the only answer. (A *re-export* of a MakerWorld project is a
+different thing: the CLI copies `Auxiliaries/` through, so the designer's
+pictures survive it.)
+
+The stage is in the response because it changes what the picture **is** — a
+studio render of the finished toy, a photograph of somebody else's print, or
+untextured geometry — and only the caller can decide what each is good for.
+Passing `stage` asks for exactly that one, which is how you get our geometry for
+a model that has a perfectly good studio render sitting in it.
+
+#### `assembled`
+
+Only ever set on `geometry`; `null` on the other two, because what a designer
+photographed is not knowable from here.
+
+`true` means the pieces in the picture are put together — the toy as it stands on
+a shelf. `false` means they are not, and the picture is the largest single piece
+of a project that only says how its parts sit on a print bed.
+
+It is measured off the drawn pieces, not read out of the file. A 3MF's
+`<assemble>` block is written by Studio into every project whether or not
+anybody assembled anything, so its presence proves nothing; and a model that is
+one object with eight components carries no `assemble_item` per piece at all and
+is nonetheless assembled. What settles it is whether the placed pieces overlap,
+within the same 0.5 mm of fit clearance that `model.assembly` uses.
+
+The picture is framed on those touching pieces and not on everything in the
+file. Alternative pieces, spare parts and accessories sit beside a model — a
+second pig's head, four spare shells, a coffee mug ten millimetres off the paws
+— and a project laid out across seven plates spreads them over half a metre of
+virtual bed. Framing on all of it renders the toy as a speck. This is the same
+cluster `model.assembly` measures, deliberately: the thing the customer is shown
+is the thing the shop quoted a size for.
+
+#### Cost
+
+`author_render` and `author_thumbnail` are a zip read and a re-encode —
+milliseconds. `geometry` is seconds to tens of seconds, roughly linear in
+triangles: 985k triangles in 5 s, 11.1M in 38 s, both at 900x900. Memory goes
+the same way and is the real ceiling — 0.8 GB and 1.7 GB for those two. Like
+slicing, call it from a queue.
 
 ## The slice response
 
@@ -285,7 +379,7 @@ service rather than found in the file.
 |---|---|---|
 | `404` | No such engine code | `detail`: string |
 | `503` | The engine exists in the registry but its binary is not in this image | `detail`: string |
-| `422` | The slice failed, **or** a request field failed validation | See below |
+| `422` | The slice failed, a render found nothing to draw, **or** a request field failed validation | See below |
 
 A failed slice returns `detail` as an object: `message`, `reason`, `exit_code`,
 and `log` — the tail of **both** output streams. Both, because the engine writes
@@ -319,6 +413,12 @@ that cannot be sliced at all still cannot be sliced; it only takes longer to hea
 that. A **named** refusal is the exception and arrives at once: `off_bed` is
 deterministic, so repeating it would only spend slices to reach the same word.
 
+A render that produces nothing returns `detail` as `{"message", "stage"}`, where
+`message` lists what each stage was asked and what it said. It takes a file with
+no pictures in it **and** no geometry we could read, so in practice it means the
+upload is not a 3MF at all. An out-of-range `width` or `height` returns `detail`
+as a plain string naming the bounds.
+
 A malformed request instead returns FastAPI's own validation shape, `detail` as
 a list of `{loc, msg, type}`.
 
@@ -340,6 +440,9 @@ and is reported in every response.
 - **1.6** added `reason` to the 422 body and the first name in it, `off_bed`,
   which also arrives without the retries of 1.5. Callers that only read `message`
   are unaffected.
+
+- **1.7** added `POST /render`. Nothing existing changed shape; the service
+  gained `numpy` and `pillow`, and the image grew by what those weigh.
 
 Fields are added, not repurposed. The one thing a caller must handle is the
 difference between a field being **absent** — an older service that has never
