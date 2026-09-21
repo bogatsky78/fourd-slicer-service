@@ -12,6 +12,13 @@ without them the slicer aborts or crashes:
    Bambu Studio, which fails preset extraction with
    `Deserializing nil into a non-nullable object`.
 
+3. A single-filament project carries a flush matrix of one cell, and on a
+   machine profile with several nozzles the slicer dies with SIGSEGV inside
+   the slice, without a word on either stream. A customer's three eggs from
+   Snapmaker Orca did exactly that on the U1 profile, and sliced on the
+   one-nozzle P2S. Dropped rather than padded: with one filament nothing is
+   ever flushed, so no weight can move, and the slicer fills in its own.
+
 Deleting the embedded configs instead of repairing them is NOT an option: with
 project_settings.config absent the slicer segfaults even earlier, before it
 reaches the file.
@@ -40,6 +47,8 @@ OUT_OF_RANGE = {
 
 NIL = "nil"
 
+FLUSH_MATRIX = "flush_volumes_matrix"
+
 
 def _fix_ranges(cfg: dict) -> list[str]:
     changed = []
@@ -56,6 +65,20 @@ def _fix_ranges(cfg: dict) -> list[str]:
             cfg[key] = good
             changed.append(key)
     return changed
+
+
+def _fix_flush_matrix(cfg: dict) -> list[str]:
+    """Drop a one-cell flush matrix; see point 3 in the module docstring.
+
+    One cell is what a one-filament project writes (N filaments give N×N), and
+    it is the only size found to crash. Bigger matrices are left exactly as
+    they are: they size the prime tower, and the tower is weight.
+    """
+    matrix = cfg.get(FLUSH_MATRIX)
+    if isinstance(matrix, list) and len(matrix) == 1:
+        del cfg[FLUSH_MATRIX]
+        return [FLUSH_MATRIX]
+    return []
 
 
 def _fix_filament_config(cfg: dict) -> dict:
@@ -141,7 +164,7 @@ def repair(
             )
         project = json.loads(zin.read(PROJECT_CONFIG))
 
-    fixed_keys = _fix_ranges(project)
+    fixed_keys = _fix_ranges(project) + _fix_flush_matrix(project)
     overridden_keys = _apply_overrides(project, project_overrides or {})
     touched_filament_configs = []
 

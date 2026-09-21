@@ -452,6 +452,11 @@ and is reported in every response.
   `volume_mm3` and `assembly` did not. No field changed shape; a file whose
   objects stand at 100% answers exactly as before, one whose objects do not
   now answers with the size of the print rather than of the drawing.
+- **1.9** added the second name in `reason`, `conflict`, and one more thing
+  `plates[].adjustments` can say: that the prime tower was moved into a corner
+  of the bed. A one-filament project whose flush matrix is a single cell no
+  longer crashes the engine on a multi-nozzle machine; its weight is what the
+  same file always gave on a one-nozzle one. No field changed shape.
 
 Fields are added, not repurposed. The one thing a caller must handle is the
 difference between a field being **absent** — an older service that has never
