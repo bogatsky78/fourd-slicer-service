@@ -60,6 +60,32 @@ GCODE_OUTSIDE_BED = -102
 # point — the file can, and `_plate_has_objects()` asks it.
 PLATE_NOT_INSIDE = -50
 
+# And it refuses a sliced plate — exit status 155 — when two toolpaths cross:
+# its own check after slicing found the G-code of one thing inside another. The
+# file's objects do not collide with each other in a file anyone has printed
+# from, so in practice this is the prime tower, which the engine places where
+# the file says even on a bed the file was not laid out for — see
+# `_tower_away()`. Reported in words only in the engine's own log, never on
+# either stream, which is why every run is now asked to write one.
+GCODE_CONFLICT = -101
+
+# The engine's own log, asked for on every run with `--debug 3 --logfile`. Three
+# things live only there and nowhere on stdout or stderr: which two things a
+# `-101` found crossing, whether the plate was moved to fit a smaller bed than
+# the file's, and where the engine thinks the prime tower is. Under 300 lines
+# per plate, deleted with the rest of the working directory.
+ENGINE_LOG = "engine.log"
+ENGINE_LOG_LEVEL = "3"
+CONFLICT_LINE = re.compile(r"gcode path conflicts found between (.+?)\s*$", re.M)
+SHRUNK_LINE = re.compile(r"is larger than new printable size")
+NEW_CENTER_LINE = re.compile(r"new_center: \{\s*(-?[\d.]+),\s*(-?[\d.]+)\s*\}")
+TOWER_ESTIMATE_LINE = re.compile(
+    r"wipe bbox: min \{\s*(-?[\d.]+),\s*(-?[\d.]+),[^}]*\}\s*-\s*max \{\s*(-?[\d.]+),\s*(-?[\d.]+),"
+)
+TOWER_ORIGIN_LINE = re.compile(r"wipe_x\s+(-?[\d.]+),\s*wipe_y\s+(-?[\d.]+)")
+# The engine names the tower this way in its conflict line.
+TOWER_PARTY = "WipeTower"
+
 
 @dataclasses.dataclass
 class _Remedy:
@@ -247,10 +273,10 @@ class OrcaSlicerEngine(SlicerEngine):
         adjustments: list[str] = []
         tried: list[str] = []
         while not output_path and len(tried) < len(self.REMEDIES) + self.RETRIES:
-            remedy = self._remedy(request, source, workdir, plate, proc, tried)
+            remedy = self._remedy(request, source, workdir, plate, proc, tried, extra)
             if not remedy:
                 break
-            extra += remedy.argv
+            extra = self._with_flags(extra, remedy.argv)
             tried.append(remedy.kind)
             # A plain retry says nothing on its own; what is worth reporting is
             # how many of them it took, and that is only known once one worked.
@@ -291,7 +317,7 @@ class OrcaSlicerEngine(SlicerEngine):
 
     # Each named remedy is one thing worth changing about a refused plate,
     # tried at most once and in this order.
-    REMEDIES = ("tower", "labels")
+    REMEDIES = ("conflict", "tower", "labels")
 
     # How many times a plate refused for no nameable reason is simply run
     # again, unchanged. See _remedy() for why this number and not a smaller one.
@@ -305,9 +331,23 @@ class OrcaSlicerEngine(SlicerEngine):
         plate: int,
         proc,
         tried: list[str],
+        extra: list[str] | None = None,
     ) -> "_Remedy | None":
         """The next thing worth changing about a plate the binary refused."""
         code = self._result_json(workdir).get("return_code")
+        if code == GCODE_CONFLICT:
+            # Two toolpaths cross. When one of them is the prime tower it is
+            # ours to move — once, to the freest corner of the bed — and when
+            # neither is, the file's own layout is what collides and no
+            # argument of ours changes that. Either way a second `-101` is
+            # final: the same geometry crosses the same way every run.
+            parties = self._conflict(workdir)
+            if "conflict" not in tried and parties and TOWER_PARTY in parties:
+                moved = self._tower_away(request, source, workdir, plate, parties)
+                if moved:
+                    return moved
+            raise self._collision(request, parties, tried)
+
         if code == GCODE_OUTSIDE_BED:
             # Something is over the edge. Ours to fix only when it is the prime
             # tower, which we placed; anything else is the file's own layout, and
@@ -316,7 +356,7 @@ class OrcaSlicerEngine(SlicerEngine):
             # outside the same bed every time, and six retries of it are six
             # slices spent to reach the same word.
             if "tower" not in tried:
-                moved = self._tower_shift(request, source, workdir, plate)
+                moved = self._tower_shift(request, source, workdir, plate, extra)
                 if moved:
                     return moved
             raise self._off_bed(request, source, workdir, plate, proc)
@@ -391,6 +431,11 @@ class OrcaSlicerEngine(SlicerEngine):
             "--min-save",          # otherwise the export carries the full mesh
             "--outputdir", workdir,
             "--export-3mf", output_name,
+            # Neither stream ever says what `-101` found crossing, or that the
+            # plate was moved to fit our bed; the log file does, in a few
+            # hundred lines, and both streams stay exactly as they were.
+            "--debug", ENGINE_LOG_LEVEL,
+            "--logfile", os.path.join(workdir, ENGINE_LOG),
         ]
         if not request.brim:
             # **The brim is off by default, and that is a decision, not a
@@ -1178,7 +1223,12 @@ class OrcaSlicerEngine(SlicerEngine):
         return int(match.group(1)) if match else None
 
     def _tower_shift(
-        self, request: SliceRequest, source: str, workdir: str, plate: int
+        self,
+        request: SliceRequest,
+        source: str,
+        workdir: str,
+        plate: int,
+        extra: list[str] | None = None,
     ) -> "_Remedy | None":
         """Move a prime tower that hangs off our bed, or decide not to.
 
@@ -1202,7 +1252,7 @@ class OrcaSlicerEngine(SlicerEngine):
 
         bed = self._bed_box(request.machine_profile)
         tower = self._feature_box(self._plate_gcode(workdir), PRIME_TOWER_FEATURE)
-        origin = self._tower_origin(source, plate)
+        origin = self._tower_origin(source, plate, extra)
         if not bed or not tower or not origin:
             return None
 
@@ -1232,15 +1282,344 @@ class OrcaSlicerEngine(SlicerEngine):
             note="prime tower moved " + " and ".join(moved) + " to fit the bed",
         )
 
-    def _tower_origin(self, source: str, plate: int) -> tuple[float, float] | None:
-        """Where the file puts the prime tower, as the shift's starting point.
+    # How far from the bed's edge the tower's origin is put, in millimetres. On
+    # the U1 the tower's brim reaches a few millimetres behind its origin; ten
+    # covers that and leaves the tower where it was put rather than half off
+    # the bed, which would only cost a `-102` and a shift back to here.
+    TOWER_EDGE_MARGIN = 10.0
 
-        Read from the project rather than measured off the G-code: the tower
-        section of a G-code file also holds the travel moves that fetch and
-        leave it, so its bounding box starts wherever the object is, not where
-        the tower does. The position is stored per plate, since each plate gets
-        its own tower.
+    # What the tower's width is taken to be when the process profile does not
+    # say. Orca's own default.
+    TOWER_WIDTH_DEFAULT = 35.0
+
+    def _tower_away(
+        self,
+        request: SliceRequest,
+        source: str,
+        workdir: str,
+        plate: int,
+        parties: str,
+    ) -> "_Remedy | None":
+        """Put a prime tower that crosses the print into the freest corner of the bed.
+
+        **Why it crosses at all.** The tower's place is stored in the file for
+        the author's bed. When ours is smaller, the engine moves the plate's
+        objects to sit centred on our bed — and leaves the tower where the file
+        put it. Its log even says the tower moved with them; the G-code says it
+        did not. A dragon laid out on a 350 × 320 H2D bed, with its tower
+        beside it, lands on a 270 × 270 U1 bed with the tower across its
+        back. And our tower is not the author's either: two filaments on a
+        tool changer give a 65 × 12 mm strip, where the file expected a 24 mm
+        square.
+
+        **So the tower goes to a corner of *our* bed, in absolute millimetres,
+        and grows along an edge.** `wipe_tower_rotation_angle` turns the tower
+        about its origin — 0 grows it along +x, 90 along +y, 180 along −x, 270
+        along −y, measured on the U1 — so each corner has one rotation that
+        keeps the strip on the edge and its depth pointing inward. The corner
+        is the one whose tower box sits clearest of the objects as they will
+        finally lie: their own boxes from `--info` pushed through the build
+        items, plus the centring the engine will apply, recomputed for the
+        tower's new place because the engine centres objects *and its
+        estimate of the tower* together.
+
+        **Guesses are for ranking only.** The tower's real footprint on this
+        machine is not known before it is sliced — a width from the process
+        profile times the filaments the file names, and as deep as it is wide,
+        is the conservative box the corners are ranked by. The engine then has
+        the last word: a corner that still crosses is a second `-101` and a
+        refusal with a name, a tower that hangs off the bed is a `-102` and
+        `_tower_shift()` walks it back in from where it is now.
+
+        Returns None when the file or the profile cannot be read well enough to
+        rank anything, which leaves the refusal as it was.
         """
+        bed = self._bed_box(request.machine_profile)
+        objects = self._plate_footprint(source, plate)
+        if not bed or not objects:
+            return None
+
+        log = self._engine_log(workdir)
+        width = self._tower_width(request.process_profile, source)
+        depth = width
+        margin = self.TOWER_EDGE_MARGIN
+        x0, x1, y0, y1 = bed
+
+        # (name, origin, rotation, the box the tower is assumed to fill)
+        corners = (
+            ("bottom-left", (x0 + margin, y0 + margin), 0,
+             (x0 + margin, x0 + margin + width, y0 + margin, y0 + margin + depth)),
+            ("bottom-right", (x1 - margin, y0 + margin), 90,
+             (x1 - margin - depth, x1 - margin, y0 + margin, y0 + margin + width)),
+            ("top-right", (x1 - margin, y1 - margin), 180,
+             (x1 - margin - width, x1 - margin, y1 - margin - depth, y1 - margin)),
+            ("top-left", (x0 + margin, y1 - margin), 270,
+             (x0 + margin, x0 + margin + depth, y1 - margin - width, y1 - margin)),
+        )
+
+        ranked = []
+        for name, origin, angle, box in corners:
+            dx, dy = self._recentring(log, bed, objects, origin)
+            final = (objects[0] + dx, objects[1] + dx, objects[2] + dy, objects[3] + dy)
+            clearance = max(
+                final[0] - box[1],
+                box[0] - final[1],
+                final[2] - box[3],
+                box[2] - final[3],
+            )
+            ranked.append((clearance, name, origin, angle))
+        # Ties keep the listed order: the bottom-left corner asks nothing of
+        # the guessed size, so it is the one to prefer when nothing separates.
+        clearance, name, origin, angle = max(ranked, key=lambda r: r[0])
+
+        other = self._conflict_other(parties)
+        return _Remedy(
+            kind="conflict",
+            argv=[
+                "--wipe-tower-x", f"{round(origin[0], 3)}",
+                "--wipe-tower-y", f"{round(origin[1], 3)}",
+                "--wipe-tower-rotation-angle", str(angle),
+            ],
+            note=(
+                f"prime tower moved to the {name} corner of the bed, "
+                f"where the file put it across {other}"
+            ),
+        )
+
+    def _collision(
+        self, request: SliceRequest, parties: str | None, tried: list[str]
+    ) -> SliceFailed:
+        """The refusal for toolpaths that cross, named so the caller can keep it.
+
+        Final for the same reason `off_bed` is: the same file on the same bed
+        crosses the same way every run, and there is nothing left of ours to
+        move. Two sentences, because they lead somewhere different — a tower
+        that finds no free corner is a bed too full for this print, a file
+        whose own parts collide is a file to fix.
+        """
+        bed = self._bed_limits(request.machine_profile)
+        where = f" ({self._bed_words(bed)})" if bed else ""
+        if parties and TOWER_PARTY in parties:
+            other = self._conflict_other(parties)
+            if "conflict" in tried:
+                detail = (
+                    f"the prime tower crosses {other} where the file puts it "
+                    f"and in the freest corner of the bed{where} alike"
+                )
+            else:
+                detail = f"the prime tower crosses {other} and could not be placed elsewhere"
+        elif parties:
+            detail = f"the file's own layout makes {self._quote(parties)} cross"
+        else:
+            detail = "two toolpaths cross and the engine did not say which"
+        return SliceFailed(
+            f"{self.code}: the print cannot be sliced on this bed: {detail}",
+            exit_code=256 + GCODE_CONFLICT,
+            reason=SliceFailed.CONFLICT,
+        )
+
+    def _conflict(self, workdir: str) -> str | None:
+        """What the engine's log says crossed, as its own `A and B` phrase."""
+        found = CONFLICT_LINE.findall(self._engine_log(workdir))
+        return found[-1].strip() if found else None
+
+    def _conflict_other(self, parties: str) -> str:
+        """The other party of a tower conflict, quoted. The engine writes
+        `A and B`; an object's own name may hold an `and`, so only the tower's
+        end of the phrase is trusted to be the separator."""
+        head, tail = f"{TOWER_PARTY} and ", f" and {TOWER_PARTY}"
+        if parties.startswith(head):
+            name = parties[len(head):]
+        elif parties.endswith(tail):
+            name = parties[: -len(tail)]
+        else:
+            name = parties
+        return self._quote(name.strip())
+
+    @staticmethod
+    def _quote(text: str) -> str:
+        return f"«{text}»"
+
+    @staticmethod
+    def _engine_log(workdir: str) -> str:
+        try:
+            with open(os.path.join(workdir, ENGINE_LOG), encoding="utf-8", errors="ignore") as handle:
+                return handle.read()
+        except OSError:
+            return ""
+
+    def _recentring(
+        self,
+        log: str,
+        bed: tuple[float, ...],
+        objects: tuple[float, float, float, float],
+        origin: tuple[float, float],
+    ) -> tuple[float, float]:
+        """How far the engine will move the plate's objects, for a tower put here.
+
+        Nothing, unless the log says the file's bed is larger than ours. Then
+        the engine centres the box around the objects *and its own estimate of
+        the tower* on the bed — the estimate is in the log too, as a box
+        around the file's tower origin, and it is the same box wherever the
+        tower is put and however it is turned. So the box is carried to the
+        new origin, the centring is recomputed, and that is where the objects
+        will lie; the tower itself stays exactly where it is put.
+        """
+        if not SHRUNK_LINE.search(log):
+            return 0.0, 0.0
+
+        centre = NEW_CENTER_LINE.findall(log)
+        if centre:
+            cx, cy = float(centre[-1][0]), float(centre[-1][1])
+        else:
+            cx, cy = (bed[0] + bed[1]) / 2, (bed[2] + bed[3]) / 2
+
+        lo_x, hi_x, lo_y, hi_y = objects
+        estimate = TOWER_ESTIMATE_LINE.findall(log)
+        placed = TOWER_ORIGIN_LINE.findall(log)
+        if estimate and placed:
+            ex0, ey0, ex1, ey1 = (float(v) for v in estimate[-1])
+            px, py = (float(v) for v in placed[-1])
+            lo_x = min(lo_x, origin[0] + (ex0 - px))
+            hi_x = max(hi_x, origin[0] + (ex1 - px))
+            lo_y = min(lo_y, origin[1] + (ey0 - py))
+            hi_y = max(hi_y, origin[1] + (ey1 - py))
+
+        return cx - (lo_x + hi_x) / 2, cy - (lo_y + hi_y) / 2
+
+    def _tower_width(self, process_profile: str | None, source: str) -> float:
+        """The tower's width for ranking corners: the profile's, times the
+        filaments the file names. A tool changer primes each filament in its
+        own segment side by side, which is what makes a two-filament tower on
+        the U1 twice as wide as the profile says; on a single-nozzle machine
+        the same product overstates it, which for ranking is the safe side."""
+        width = None
+        if process_profile:
+            width = self._profile_setting(process_profile, "prime_tower_width")
+        filaments = 1
+        try:
+            with zipfile.ZipFile(source) as zf:
+                project = json.loads(zf.read(PROJECT_SETTINGS))
+            if width is None:
+                width = project.get("prime_tower_width")
+            colours = project.get("filament_colour")
+            if isinstance(colours, list) and colours:
+                filaments = len(colours)
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+            pass
+        try:
+            width = float(width)
+        except (TypeError, ValueError):
+            width = self.TOWER_WIDTH_DEFAULT
+        return width * max(filaments, 1)
+
+    def _plate_footprint(
+        self, source: str, plate: int
+    ) -> tuple[float, float, float, float] | None:
+        """The box around everything on this plate, in the file's own frame.
+
+        Each object's box from `--info`, in the object's own coordinates,
+        pushed through the build item that places it on the bed — the same
+        arithmetic `_assembly()` does with the assembly's matrices, on the
+        plate's matrices instead. A turned piece yields a box a little larger
+        than the piece, which for keeping a tower clear of it is the right
+        side to err on. None when any link in that chain is missing: an
+        unreadable file, an object `--info` did not measure, a plate that
+        names nothing.
+        """
+        plates, _ = self._layout(source)
+        wanted = set(plates.get(plate or 1) or [])
+        if not wanted:
+            return None
+
+        try:
+            objects = self._inspect_file(source).objects
+            with zipfile.ZipFile(source) as zf:
+                settings = ET.fromstring(zf.read(MODEL_SETTINGS))
+                build = ET.fromstring(zf.read(MODEL_FILE))
+        except (SliceFailed, OSError, KeyError, zipfile.BadZipFile, ET.ParseError):
+            return None
+
+        ids = sorted(
+            int(o.get("id")) for o in settings.findall("object") if (o.get("id") or "").isdigit()
+        )
+        if len(ids) != len(objects):
+            return None
+        boxes = dict(zip(ids, objects))
+
+        lo = [float("inf")] * 2
+        hi = [float("-inf")] * 2
+        for item in build.iterfind(".//{*}item"):
+            object_id = item.get("objectid") or ""
+            if object_id not in wanted or not object_id.isdigit():
+                continue
+            box = boxes.get(int(object_id))
+            if box is None or box.file_min is None or box.file_max is None:
+                return None
+            matrix = (item.get("transform") or "").split()
+            try:
+                m = [float(v) for v in matrix]
+            except ValueError:
+                return None
+            if len(m) != 12:
+                m = [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]
+            for corner in itertools.product(*zip(box.file_min, box.file_max)):
+                for axis in range(2):
+                    placed = sum(m[axis + n * 3] * corner[n] for n in range(3)) + m[9 + axis]
+                    lo[axis] = min(lo[axis], placed)
+                    hi[axis] = max(hi[axis], placed)
+
+        if lo[0] == float("inf"):
+            return None
+        return lo[0], hi[0], lo[1], hi[1]
+
+    @staticmethod
+    def _with_flags(argv: list[str], added: list[str]) -> list[str]:
+        """`argv` with `added` appended, minus any earlier value of a flag
+        `added` sets: a tower moved twice is at its second place, not at both."""
+        flags = {added[n] for n in range(0, len(added) - 1, 2) if added[n].startswith("--")}
+        kept: list[str] = []
+        skip = False
+        for n, token in enumerate(argv):
+            if skip:
+                skip = False
+                continue
+            if token in flags and n + 1 < len(argv):
+                skip = True
+                continue
+            kept.append(token)
+        return kept + list(added)
+
+    @staticmethod
+    def _flag_values(argv: list[str], *flags: str) -> list[str] | None:
+        """The value after each of `flags` in `argv`, or None if any is absent."""
+        values = []
+        for flag in flags:
+            try:
+                values.append(argv[argv.index(flag) + 1])
+            except (ValueError, IndexError):
+                return None
+        return values
+
+    def _tower_origin(
+        self, source: str, plate: int, extra: list[str] | None = None
+    ) -> tuple[float, float] | None:
+        """Where the prime tower starts from, as the shift's starting point.
+
+        An earlier remedy on this plate may already have put the tower
+        somewhere else on the command line, and that is then where it is;
+        otherwise it is where the file puts it. Read from the project rather
+        than measured off the G-code: the tower section of a G-code file also
+        holds the travel moves that fetch and leave it, so its bounding box
+        starts wherever the object is, not where the tower does. The position
+        is stored per plate, since each plate gets its own tower.
+        """
+        given = self._flag_values(extra or [], "--wipe-tower-x", "--wipe-tower-y")
+        if given:
+            try:
+                return float(given[0]), float(given[1])
+            except (TypeError, ValueError):
+                return None
         try:
             with zipfile.ZipFile(source) as zf:
                 project = json.loads(zf.read(PROJECT_SETTINGS))

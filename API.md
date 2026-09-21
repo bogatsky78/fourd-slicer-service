@@ -261,9 +261,10 @@ costs is a property of the machine, and how many changes there will be is a
 property of the print, and only the thing that sliced it knows the second half.
 
 **`plates[].adjustments`** lists what had to be changed before that plate would
-slice at all — moving a purge tower back onto the bed, for instance. It is
-reported rather than done quietly, because it means the file describes a print
-this machine cannot run as the author laid it out.
+slice at all — moving a purge tower back onto the bed, or into a free corner
+of it when the engine found it across a part, for instance. It is reported
+rather than done quietly, because it means the file describes a print this
+machine cannot run as the author laid it out.
 
 A plate that took more than one run of the engine to slice says so here too,
 with the count. Some refusals come and go: the same plate, the same arguments,
@@ -391,11 +392,12 @@ on.
 **`reason` is present on every refusal and null on most of them.** A name means
 the refusal is a fact about the model, worth storing against the product and
 worth acting on; null means the slicer simply said no, and only the sentence and
-the log describe it. One name exists today:
+the log describe it. Two names exist today:
 
 | `reason` | What it means | What the caller can do |
 |---|---|---|
 | `off_bed` | The print does not fit the bed of the machine it was sliced for — a part is larger than the bed, or the plate is laid out past its edge | Nothing that involves trying again: a different printer, or a different file |
+| `conflict` | Two toolpaths cross. Either the prime tower crosses a part both where the file puts it and in the freest corner of the bed — the service tried that corner first — or the file's own parts cross each other | Nothing that involves trying again either: a looser layout with a free corner for the tower, or a smaller model |
 
 `message` says which of the two it is, and in millimetres: `part 1 is 68.837 mm
 on y against 60.0`, or `no part is larger than the bed (270.0 × 270.0 × 270.05
@@ -410,8 +412,9 @@ not once. Past the fixes it has names for, the service runs a refused plate agai
 consequences worth planning for: a slice that fails now takes several times
 longer to say so, and a timeout on the caller's side has to allow for it. A file
 that cannot be sliced at all still cannot be sliced; it only takes longer to hear
-that. A **named** refusal is the exception and arrives at once: `off_bed` is
-deterministic, so repeating it would only spend slices to reach the same word.
+that. A **named** refusal is the exception and arrives at once: `off_bed` and
+`conflict` are deterministic, so repeating them would only spend slices to
+reach the same word.
 
 A render that produces nothing returns `detail` as `{"message", "stage"}`, where
 `message` lists what each stage was asked and what it said. It takes a file with

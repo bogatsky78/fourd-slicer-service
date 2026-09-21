@@ -251,6 +251,10 @@ class SliceFailed(RuntimeError):
 
     #: The plate hangs off the bed and no argument of ours would change that.
     OFF_BED = "off_bed"
+    #: Two toolpaths cross — the prime tower and a part, once the tower has
+    #: been given the freest corner of the bed and still crosses, or two parts
+    #: in the file's own layout — and no argument of ours would change that.
+    CONFLICT = "conflict"
 
     def __init__(
         self,

@@ -18,7 +18,7 @@ import render
 from engines import registry
 from engines.base import EngineUnavailable, SliceFailed, SliceRequest
 
-app = FastAPI(title="FourD Slicer Service", version="1.8")
+app = FastAPI(title="FourD Slicer Service", version="1.9")
 
 WORKDIR_ROOT = os.environ.get("SLICER_WORKDIR", "/work")
 
