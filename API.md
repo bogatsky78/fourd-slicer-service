@@ -1,6 +1,6 @@
 # API reference
 
-Everything the service accepts and everything it answers, for version **1.7**.
+Everything the service accepts and everything it answers, for version **1.8**.
 
 A running instance serves the machine-readable schema at `/openapi.json` and a
 browsable form of it at `/docs`; the endpoint and parameter tables below are
@@ -443,6 +443,12 @@ and is reported in every response.
 
 - **1.7** added `POST /render`. Nothing existing changed shape; the service
   gained `numpy` and `pillow`, and the image grew by what those weigh.
+- **1.8** applies the file's own scale to `model`. A project saved with an
+  object scaled on the bed keeps the mesh at full size and the factor on the
+  build item; the slice always honoured it, `objects[].size_*`,
+  `volume_mm3` and `assembly` did not. No field changed shape; a file whose
+  objects stand at 100% answers exactly as before, one whose objects do not
+  now answers with the size of the print rather than of the drawing.
 
 Fields are added, not repurposed. The one thing a caller must handle is the
 difference between a field being **absent** — an older service that has never

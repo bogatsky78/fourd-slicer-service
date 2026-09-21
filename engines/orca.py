@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -31,6 +32,7 @@ from .base import (
 
 SLICE_INFO = "Metadata/slice_info.config"
 MODEL_SETTINGS = "Metadata/model_settings.config"
+MODEL_FILE = "3D/3dmodel.model"
 PROJECT_SETTINGS = "Metadata/project_settings.config"
 # Written by the binary into the output directory on the way out, success or
 # failure, and the only place the reason is spelled in words.
@@ -459,6 +461,16 @@ class OrcaSlicerEngine(SlicerEngine):
         `--info` reports the model as it sits in the file; `--scale` is applied
         later, during slicing. Multiplying here is what makes the answer the
         size of the printed object rather than of the drawing.
+
+        **The file's own scale is not applied by `--info` either**, and that
+        one is not a request parameter but a fact about the model: a project
+        saved with an object at 50% carries the mesh at full size and the 0.5
+        on the build item's matrix in `3D/3dmodel.model`. The slice honours it
+        — the customer's dragon printed 89 mm long and weighed 25.5 g — while
+        `--info` measured the mesh and said 178. Two numbers from one analysis
+        describing two different dragons, and the shop showed the customer the
+        size of the one they were not buying. So the build item's scale is
+        read here and folded into every size the same way the request's is.
         """
         proc = self._run(
             ["--info", "--allow-newer-file", "--no-check", path],
@@ -467,10 +479,15 @@ class OrcaSlicerEngine(SlicerEngine):
         )
 
         factor = scale if scale > 0 else 1.0
-        objects = [
-            self._object(block, factor)
+        blocks = [
+            block
             for block in self._info_blocks(proc.stdout or "")
             if {"size_x", "size_y", "size_z"} <= block.keys()
+        ]
+        scales = self._build_scales(path, len(blocks))
+        objects = [
+            self._object(block, factor, scales[n] if scales else None)
+            for n, block in enumerate(blocks)
         ]
 
         if not objects:
@@ -481,6 +498,56 @@ class OrcaSlicerEngine(SlicerEngine):
             )
 
         return ModelInfo(objects=objects, assembly=self._assembly(path, objects, factor))
+
+    def _build_scales(self, path: str, count: int) -> list[tuple[float, float, float]] | None:
+        """The scale each object's build item applies to it, in `--info` order.
+
+        `3D/3dmodel.model` places every object on the bed with one `<item>` per
+        instance, whose `transform` is the 3MF's 3×4 row-major matrix: a point
+        travels as `p · M + t`, so the length of row *i* is what the object's
+        own axis *i* is stretched by. Rotation leaves those lengths at one,
+        which is what makes them usable on a box `--info` measured in the
+        object's own frame: the object is not turned by this, only sized.
+
+        Matched to the `--info` blocks the way `_assembly` matches them — by
+        ascending object id, the only link there is — and refused whole when
+        the counts disagree, for the same reason. An object with several
+        instances takes its first: two instances of one object at two scales
+        is a layout nobody has produced yet, and guessing between them would be
+        worse than the first.
+
+        None when the file names no build at all (a bare mesh) or cannot be
+        read as a 3MF, which leaves the sizes exactly as `--info` said them.
+        """
+        try:
+            with zipfile.ZipFile(path) as zf:
+                if MODEL_FILE not in zf.namelist():
+                    return None
+                root = ET.fromstring(zf.read(MODEL_FILE))
+        except (OSError, zipfile.BadZipFile, ET.ParseError):
+            return None
+
+        scales: dict[int, tuple[float, float, float]] = {}
+        for item in root.iterfind(".//{*}item"):
+            object_id = item.get("objectid") or ""
+            if not object_id.isdigit() or int(object_id) in scales:
+                continue
+            matrix = (item.get("transform") or "").split()
+            if len(matrix) != 12:
+                scales[int(object_id)] = (1.0, 1.0, 1.0)
+                continue
+            try:
+                m = [float(v) for v in matrix]
+            except ValueError:
+                return None
+            scales[int(object_id)] = tuple(
+                math.sqrt(sum(m[axis * 3 + n] ** 2 for n in range(3))) for axis in range(3)
+            )
+
+        if len(scales) != count:
+            return None
+
+        return [scales[object_id] for object_id in sorted(scales)]
 
     def _assembly(
         self, path: str, objects: list[ModelObject], factor: float = 1.0
@@ -555,6 +622,7 @@ class OrcaSlicerEngine(SlicerEngine):
         boxes = dict(zip(ids, objects))
 
         placed: list[tuple[list[float], list[float], float]] = []
+        scales: list[tuple[float, float, float]] = []
         for item in items.findall("assemble_item"):
             box = boxes.get(int(item.get("object_id") or -1)) if (item.get("object_id") or "").isdigit() else None
             if box is None or box.file_min is None or box.file_max is None:
@@ -564,9 +632,25 @@ class OrcaSlicerEngine(SlicerEngine):
             if len(matrix) != 12:
                 return None
 
+            # The build item's scale is *not* applied to the corners here.
+            # The matrices of this block place unscaled pieces — the customer's
+            # 50% dragon has 0.5 on its build item and a bare translation here,
+            # and the hydra's parts stand at 1.5 on the bed with the same
+            # unit matrices in the assembly — so scaling a piece about its own
+            # origin would pull it out of contact with its neighbours and
+            # dissolve the glued group (the hydra fell from 31 parts to 1 when
+            # that was tried). The assembly is measured in the file's frame
+            # and scaled whole at the end, where the translations scale with it.
+            corners = itertools.product(*zip(box.file_min, box.file_max))
+            unscaled_here = all(
+                abs(math.sqrt(sum(matrix[axis * 3 + n] ** 2 for n in range(3))) - 1.0) <= 1e-3
+                for axis in range(3)
+            )
+            scales.append(box.build_scale if unscaled_here and box.build_scale else (1.0, 1.0, 1.0))
+
             lo = [float("inf")] * 3
             hi = [float("-inf")] * 3
-            for corner in itertools.product(*zip(box.file_min, box.file_max)):
+            for corner in corners:
                 for axis in range(3):
                     placement = sum(
                         matrix[axis * 3 + n] * corner[n] for n in range(3)
@@ -592,10 +676,19 @@ class OrcaSlicerEngine(SlicerEngine):
         # in the file's own coordinates, so a factor applied to the corners would
         # have to be applied to the translations too. Uniform scaling about the
         # origin makes the two identical, and doing it once here says so.
+        #
+        # The build item's scale rides the same way, when the assembly's own
+        # matrices did not carry it: the piece holding the most material sets
+        # it for the whole toy. Most files scale every piece alike, and where
+        # one peg is squashed on its own axis the toy's box does not move with
+        # it. An estimate for a non-uniformly scaled assembly, exact for the
+        # rest — and the printed size, not the drawing's, either way.
+        dominant = max(group, key=lambda i: placed[i][2])
+        build = scales[dominant]
         return Assembly(
-            size_x=round((hi[0] - lo[0]) * factor, 3),
-            size_y=round((hi[1] - lo[1]) * factor, 3),
-            size_z=round((hi[2] - lo[2]) * factor, 3),
+            size_x=round((hi[0] - lo[0]) * build[0] * factor, 3),
+            size_y=round((hi[1] - lo[1]) * build[1] * factor, 3),
+            size_z=round((hi[2] - lo[2]) * build[2] * factor, 3),
             part_count=len(group),
         )
 
@@ -685,13 +778,21 @@ class OrcaSlicerEngine(SlicerEngine):
         return blocks
 
     @classmethod
-    def _object(cls, values: dict[str, str], factor: float) -> ModelObject:
+    def _object(
+        cls,
+        values: dict[str, str],
+        factor: float,
+        build_scale: tuple[float, float, float] | None = None,
+    ) -> ModelObject:
+        sx, sy, sz = build_scale or (1.0, 1.0, 1.0)
         return ModelObject(
-            size_x=round(float(values["size_x"]) * factor, 3),
-            size_y=round(float(values["size_y"]) * factor, 3),
-            size_z=round(float(values["size_z"]) * factor, 3),
-            # Volume scales with the cube of a linear factor, not with the factor.
-            volume_mm3=cls._maybe_float(values.get("volume"), factor ** 3),
+            size_x=round(float(values["size_x"]) * sx * factor, 3),
+            size_y=round(float(values["size_y"]) * sy * factor, 3),
+            size_z=round(float(values["size_z"]) * sz * factor, 3),
+            # Volume scales with the product of the three linear factors — the
+            # cube of a uniform one — not with the factor.
+            volume_mm3=cls._maybe_float(values.get("volume"), sx * sy * sz * factor ** 3),
+            build_scale=build_scale,
             facet_count=cls._maybe_int(values.get("number_of_facets")),
             manifold=cls._maybe_bool(values.get("manifold")),
             # Unrounded and unscaled, unlike the lengths above: these are what

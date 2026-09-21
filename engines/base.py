@@ -81,6 +81,11 @@ class ModelObject:
     # business and answers nothing a caller asked.
     file_min: tuple[float, float, float] | None = None
     file_max: tuple[float, float, float] | None = None
+    # What the file's build item scales this object by, per local axis, or
+    # None when it names no scale. Already folded into size_* and volume_mm3;
+    # carried on its own because the corners above are not scaled, and the
+    # assembly has to decide for itself whether to apply it. Not published.
+    build_scale: tuple[float, float, float] | None = None
 
     @property
     def longest_edge(self) -> float:
