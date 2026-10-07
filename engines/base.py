@@ -46,6 +46,10 @@ class PlateUsage:
     filaments: list[FilamentUsage] = field(default_factory=list)
     # None means the slicer did not say, which is not the same as no changes.
     filament_changes: int | None = None
+    # Grams of every support the plate prints, largest first — one entry per
+    # support an operator snaps off. Empty: printed without supports. None: the
+    # G-code could not be read for it. See supports.py.
+    supports: list[float] | None = None
     warnings: list[str] = field(default_factory=list)
     # What had to be changed before the plate would slice at all — moving a
     # prime tower onto the bed, for instance. Reported rather than done quietly,
@@ -86,6 +90,22 @@ class ModelObject:
     # carried on its own because the corners above are not scaled, and the
     # assembly has to decide for itself whether to apply it. Not published.
     build_scale: tuple[float, float, float] | None = None
+    # Material as `--info` measured it, before either scale. Not published: the
+    # assembly ranks its groups by material in the file's frame, the same frame
+    # its corners are in, and volume_mm3 above has the build item's scale in
+    # it — which differs from piece to piece in a file like the hydra's.
+    file_volume_mm3: float | None = None
+    # The object's id in the file, which is how the plates name it. Null for a
+    # file that has no ids to give (a bare mesh).
+    object_id: int | None = None
+    # The plate the object stands on, 1-based. Null means **on no plate at
+    # all**: the author parked it off the beds, nothing prints it, and it is
+    # left out of every aggregate and of the assembly. A file that says nothing
+    # about plates prints as one, so everything in it is on plate 1.
+    plate: int | None = None
+    # Whether the object is one of the pieces the assembly glued together.
+    # Null where there is no assembly to belong to.
+    in_assembly: bool | None = None
 
     @property
     def longest_edge(self) -> float:
@@ -113,6 +133,33 @@ class Assembly:
     size_y: float
     size_z: float
     part_count: int
+    # Indices into ModelInfo.objects of the pieces counted in part_count. Not
+    # published as such; each object carries its own `in_assembly` instead.
+    members: list[int] = field(default_factory=list)
+
+
+@dataclass
+class PlateLayout:
+    """One plate as the file lays it out — before anything is sliced.
+
+    `name` is the author's own label for the plate, when there is one. It is
+    the best hint the file holds about *why* a plate exists ("AMS", "1C
+    Keyring - Mini"), and nothing more than a hint: it is free text.
+    """
+
+    index: int
+    name: str | None = None
+    object_count: int = 0
+    # "ams" — the plate's objects use more than one palette slot, so it prints
+    # with a prime tower; "simple" — one colour, no tower.
+    kind: str | None = None
+    # "multi" — several models on the plate, all the same shape; "one" — a
+    # single model, or several different ones. Null when the meshes were not
+    # read.
+    copies: str | None = None
+    # What comes off the plate as one thing each: {"kind": "part" | "ams" |
+    # "flexi", "object_ids": [...], "shells": n}. See layout.py.
+    models: list[dict] | None = None
 
 
 @dataclass
@@ -139,19 +186,34 @@ class ModelInfo:
 
     objects: list[ModelObject] = field(default_factory=list)
     assembly: Assembly | None = None
+    plates: list[PlateLayout] = field(default_factory=list)
+    # How the plates relate to one another — see OrcaSlicerEngine._layout_kind:
+    # "single" (one plate), "assembly" (pieces on different plates glue into
+    # one model) or "separate" (every plate holds models of its own). Null
+    # when the file could not be read for it.
+    layout: str | None = None
+    # Only for "separate": whether every plate holds the same kind of model —
+    # a hint that the plates are variants of one model rather than a set.
+    # A hint and no more; which plates to print is a person's call.
+    plates_alike: bool | None = None
+
+    @property
+    def printed(self) -> list[ModelObject]:
+        """The objects that stand on a plate. Every aggregate counts only these."""
+        return [o for o in self.objects if o.plate is not None or not self.plates]
 
     @property
     def object_count(self) -> int:
-        return len(self.objects)
+        return len(self.printed)
 
     @property
     def total_volume_mm3(self) -> float | None:
-        volumes = [o.volume_mm3 for o in self.objects if o.volume_mm3 is not None]
+        volumes = [o.volume_mm3 for o in self.printed if o.volume_mm3 is not None]
         return round(sum(volumes), 3) if volumes else None
 
     @property
     def largest(self) -> ModelObject | None:
-        return max(self.objects, key=lambda o: o.longest_edge, default=None)
+        return max(self.printed, key=lambda o: o.longest_edge, default=None)
 
     @property
     def size_x(self) -> float | None:
@@ -168,12 +230,18 @@ class ModelInfo:
     # What an object publishes. Listed rather than taken from `asdict`, because
     # ModelObject also carries the corners the assembly is built from, and those
     # are coordinates in a frame the caller has no way to interpret.
-    OBJECT_FIELDS = ("size_x", "size_y", "size_z", "volume_mm3", "facet_count", "manifold")
+    OBJECT_FIELDS = (
+        "size_x", "size_y", "size_z", "volume_mm3", "facet_count", "manifold",
+        "object_id", "plate", "in_assembly",
+    )
+    ASSEMBLY_FIELDS = ("size_x", "size_y", "size_z", "part_count")
 
     def to_payload(self) -> dict:
         """Serialised by hand because `dataclasses.asdict` cannot see properties,
         and the aggregates are the part most callers actually read."""
         return {
+            # Every object the file holds, off-plate ones included and marked
+            # so; the aggregates after it count only what is printed.
             "objects": [
                 {name: getattr(o, name) for name in self.OBJECT_FIELDS}
                 for o in self.objects
@@ -185,7 +253,13 @@ class ModelInfo:
             "size_z": self.size_z,
             # Null means the file does not say, and must not be read as zero or
             # quietly replaced with the largest piece — see Assembly.
-            "assembly": dataclasses.asdict(self.assembly) if self.assembly else None,
+            "assembly": (
+                {name: getattr(self.assembly, name) for name in self.ASSEMBLY_FIELDS}
+                if self.assembly else None
+            ),
+            "plates": [dataclasses.asdict(p) for p in self.plates],
+            "layout": self.layout,
+            "plates_alike": self.plates_alike,
         }
 
 
@@ -201,6 +275,9 @@ class SliceResult:
     raw: str | None = None
     model: ModelInfo | None = None
     plates: list[PlateUsage] = field(default_factory=list)
+    # Which plates the totals above are made of, when the request named some;
+    # empty for a whole-file slice.
+    plates_sliced: list[int] = field(default_factory=list)
 
     @property
     def filament_count(self) -> int:
@@ -231,6 +308,10 @@ class SliceRequest:
     filament_profiles: list[str] = field(default_factory=list)
     scale: float = 1.0
     plate: int = 0  # 0 = all plates
+    # Several plates, 1-based, when only some are to be printed — the variants
+    # case, where a person picked which of a file's plates the product is.
+    # Takes precedence over `plate`; empty means `plate` decides.
+    plates: list[int] = field(default_factory=list)
     brim: bool = False  # see OrcaSlicerEngine._run_slice for why off is the default
 
 

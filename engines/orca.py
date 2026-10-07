@@ -17,12 +17,16 @@ import subprocess
 import xml.etree.ElementTree as ET
 import zipfile
 
+import layout
+import supports
+
 from .base import (
     Assembly,
     EngineUnavailable,
     FilamentUsage,
     ModelInfo,
     ModelObject,
+    PlateLayout,
     PlateUsage,
     SliceFailed,
     SliceRequest,
@@ -212,7 +216,17 @@ class OrcaSlicerEngine(SlicerEngine):
         )
 
         declared = self._plate_count(source)
-        wanted = [request.plate] if request.plate else self._plates_to_slice(declared)
+        if request.plates:
+            # Only the plates a person chose, in the file's order. A number the
+            # file does not have is refused rather than skipped: the price of
+            # "plates 1 and 14" of a twelve-plate file is not the price of plate 1.
+            wanted = sorted(set(request.plates))
+            if wanted[0] < 1 or wanted[-1] > declared:
+                raise SliceFailed(
+                    f"{self.code}: plates {wanted} asked of a file with {declared}",
+                )
+        else:
+            wanted = [request.plate] if request.plate else self._plates_to_slice(declared)
 
         sliced = []
         learned: list[str] = []
@@ -229,12 +243,25 @@ class OrcaSlicerEngine(SlicerEngine):
             sliced.append((usage, log))
 
         result = self._merge([p for p, _ in sliced], plate_count=max(declared, len(sliced)))
+        result.plates_sliced = wanted if request.plates else []
         # The log of the last plate to run, which is where a warning about the
         # whole job lands; the per-plate detail is in `plates`.
         result.raw = sliced[-1][1] if sliced else None
         # Measured off the same repaired copy the slice just consumed, so the
         # dimensions describe exactly the geometry the weights came from.
-        result.model = self._inspect_file(source, request.scale)
+        result.model = self._inspect_file(
+            source, request.scale, models=True, only=set(wanted) if request.plates else None
+        )
+        # A plate's kind as the slice found it, which beats the file's slot
+        # assignments: the hydra's file puts two colours on a plate the engine
+        # loads one filament for, and a prime tower is built for what is loaded.
+        sliced_kind = {
+            p.index: ("ams" if len([f for f in p.filaments if f.used_g > 0]) > 1 else "simple")
+            for p in result.plates
+        }
+        for plate in result.model.plates:
+            if plate.index in sliced_kind:
+                plate.kind = sliced_kind[plate.index]
 
         return result
 
@@ -307,6 +334,7 @@ class OrcaSlicerEngine(SlicerEngine):
 
         usage = self._parse_plate(output_path, plate, palette, facts)
         usage.filament_changes = self._filament_changes(workdir)
+        usage.supports = supports.plate_supports(self._plate_gcode(workdir))
         usage.adjustments = adjustments
         # Everything wanted from this plate has been read. An eleven-plate
         # assembly would otherwise hold eleven G-code files at once, and the
@@ -491,11 +519,13 @@ class OrcaSlicerEngine(SlicerEngine):
         # dies with `return -24` exactly as slicing does.
         source = self.preprocess(request.input_path, workdir, {})
 
-        return self._inspect_file(source, request.scale)
+        return self._inspect_file(source, request.scale, models=True)
 
     # -- internals ---------------------------------------------------------
 
-    def _inspect_file(self, path: str, scale: float = 1.0) -> ModelInfo:
+    def _inspect_file(
+        self, path: str, scale: float = 1.0, models: bool = False, only: set[int] | None = None
+    ) -> ModelInfo:
         """Ask the binary what the model measures.
 
         `--allow-newer-file --no-check` are not optional here for the same
@@ -542,7 +572,202 @@ class OrcaSlicerEngine(SlicerEngine):
                 log=self._log(proc),
             )
 
-        return ModelInfo(objects=objects, assembly=self._assembly(path, objects, factor))
+        plates, parts = self._place_on_plates(path, objects)
+        assembly = self._assembly(path, objects, factor)
+        if assembly is not None:
+            members = set(assembly.members)
+            for n, obj in enumerate(objects):
+                obj.in_assembly = n in members if obj.plate is not None or not plates else None
+
+        layout, alike = self._layout_kind(objects, plates, assembly, parts)
+        if models:
+            # Only the plates being printed are worth reading the meshes of: a
+            # variants file sliced on one plate of twelve would otherwise pay
+            # for all twelve (Foxycat: 100 s of a 115 s slice).
+            self._plate_models(path, objects, plates, only)
+        return ModelInfo(
+            objects=objects,
+            assembly=assembly,
+            plates=plates,
+            layout=layout,
+            plates_alike=alike,
+        )
+
+    def _place_on_plates(
+        self, path: str, objects: list[ModelObject]
+    ) -> tuple[list[PlateLayout], dict[int, frozenset[str]]]:
+        """Give every object its id and the plate it stands on.
+
+        `model_settings.config` lists each plate's objects by id, and `--info`
+        prints its blocks in ascending id — the pairing `_assembly` relies on
+        and the only one there is. When the counts disagree the pairing cannot
+        be trusted, so nothing is stamped and every object stays where a file
+        with no plates puts it: printed, on no named plate.
+
+        An object no plate lists keeps `plate = None`: it stands off the beds,
+        nothing prints it, and every aggregate leaves it out. Not one file in
+        the shop's catalogue has such an object (28 files, 2026-10-07) — the
+        "loose extras" beside an assembly turned out to stand on plates and to
+        be printed — but the case is real in Studio and has to read as what it
+        is.
+
+        Returns the plates in file order, and per object id the names of its
+        parts — what `_layout_kind` compares plates by.
+        """
+        root = self._model_settings(path)
+        if root is None:
+            for obj in objects:
+                obj.plate = 1
+            return [], {}
+
+        ids = sorted(int(o.get("id")) for o in root.findall("object") if (o.get("id") or "").isdigit())
+        if len(ids) != len(objects):
+            return [], {}
+
+        parts: dict[int, frozenset[str]] = {}
+        for node in root.findall("object"):
+            if not (node.get("id") or "").isdigit():
+                continue
+            names = [
+                meta.get("value")
+                for part in node.findall("part")
+                for meta in part.findall("metadata")
+                if meta.get("key") == "name" and meta.get("value")
+            ]
+            if not names:
+                names = [
+                    meta.get("value")
+                    for meta in node.findall("metadata")
+                    if meta.get("key") == "name" and meta.get("value")
+                ]
+            parts[int(node.get("id"))] = frozenset(names)
+
+        plate_of: dict[int, int] = {}
+        plates: list[PlateLayout] = []
+        for node in root.findall("plate"):
+            meta = {m.get("key"): m.get("value") for m in node.findall("metadata")}
+            if not (meta.get("plater_id") or "").isdigit():
+                continue
+            index = int(meta["plater_id"])
+            on_plate = [
+                int(m.get("value"))
+                for instance in node.findall("model_instance")
+                for m in instance.findall("metadata")
+                if m.get("key") == "object_id" and (m.get("value") or "").isdigit()
+            ]
+            for object_id in on_plate:
+                plate_of.setdefault(object_id, index)
+            plates.append(PlateLayout(
+                index=index,
+                name=(meta.get("plater_name") or "").strip() or None,
+                object_count=len(set(on_plate)),
+            ))
+
+        for object_id, obj in zip(ids, objects):
+            obj.object_id = object_id
+            # A project with no plate list at all is one plate, as _plate_count
+            # says; one that has a list and leaves the object out of it is not.
+            obj.plate = plate_of.get(object_id) if plates else 1
+
+        return plates, parts
+
+    def _plate_models(
+        self,
+        path: str,
+        objects: list[ModelObject],
+        plates: list[PlateLayout],
+        only: set[int] | None = None,
+    ) -> None:
+        """What comes off each plate as one thing — see layout.py.
+
+        Seconds to tens of seconds, because it reads the meshes: which is why
+        only the answers a caller receives pay for it, and the `--info` runs
+        this engine makes for itself (where to put a prime tower, whether a
+        plate holds anything) do not.
+
+        A plate's `kind` is "ams" when its objects use more than one palette
+        slot — the plate that needs a prime tower — and "simple" otherwise:
+        one colour, no tower. Read from the file's slot assignments, so it
+        needs no slice.
+        """
+        if not plates:
+            return
+        on_plate: dict[int, list[int]] = {}
+        for obj in objects:
+            if obj.plate is not None and obj.object_id is not None and (only is None or obj.plate in only):
+                on_plate.setdefault(obj.plate, []).append(obj.object_id)
+
+        _, extruders = self._layout(path)
+        found = layout.plate_models(path, on_plate)
+        for plate in plates:
+            if only is not None and plate.index not in only:
+                continue
+            used = {e for oid in on_plate.get(plate.index, []) for e in extruders.get(str(oid), set())}
+            plate.kind = "ams" if len(used) > 1 else "simple"
+            result = found.get(plate.index)
+            if result is None:
+                continue
+            plate.copies = result.copies
+            plate.models = [
+                {"kind": m.kind, "object_ids": m.object_ids, "shells": m.shells}
+                for m in result.models
+            ]
+
+    @staticmethod
+    def _model_settings(path: str) -> ET.Element | None:
+        try:
+            with zipfile.ZipFile(path) as zf:
+                if MODEL_SETTINGS not in zf.namelist():
+                    return None
+                return ET.fromstring(zf.read(MODEL_SETTINGS))
+        except (OSError, zipfile.BadZipFile, ET.ParseError):
+            return None
+
+    @staticmethod
+    def _layout_kind(
+        objects: list[ModelObject],
+        plates: list[PlateLayout],
+        assembly: Assembly | None,
+        parts: dict[int, frozenset[str]],
+    ) -> tuple[str | None, bool | None]:
+        """Whether the plates are one model or several, and a hint about which.
+
+        **The one thing geometry can settle.** Pieces of one model laid out
+        across plates meet once they are put back where the author assembled
+        them: the hydra's 31 glued pieces stand on all seven of its plates.
+        A file whose glued group stays on a single plate — or that has no glued
+        group at all — holds a model, or several, on each plate.
+
+        **What it cannot.** Twelve cats on twelve plates are either twelve
+        variants to choose one from or a set of twelve to print, and the file
+        reads the same either way: that is the author's intent, not geometry.
+        So for "separate" this offers only a hint — `alike`, true when every
+        plate shares a part name with every other (Foxycat: each plate's cat is
+        a "cat body.stl" with its eyes) — and leaves the choice to a person.
+        Plate names are the other hint, and are published as they are.
+        """
+        if not plates:
+            # No plate list: one plate if the objects were placed on it, unknown
+            # if the pairing with the file's ids could not be made at all.
+            return ("single" if objects and all(o.plate == 1 for o in objects) else None), None
+
+        printed = [o for o in objects if o.plate is not None]
+        on = sorted({o.plate for o in printed})
+        if len(on) <= 1:
+            return "single", None
+
+        if assembly is not None:
+            spanned = {objects[i].plate for i in assembly.members if objects[i].plate is not None}
+            if len(spanned) > 1:
+                return "assembly", None
+
+        by_plate: dict[int, set[str]] = {}
+        for obj in printed:
+            by_plate.setdefault(obj.plate, set()).update(parts.get(obj.object_id, frozenset()))
+        if not all(by_plate.get(p) for p in on):
+            return "separate", None
+        shared = set.intersection(*(by_plate[p] for p in on))
+        return "separate", bool(shared)
 
     def _build_scales(self, path: str, count: int) -> list[tuple[float, float, float]] | None:
         """The scale each object's build item applies to it, in `--info` order.
@@ -664,14 +889,20 @@ class OrcaSlicerEngine(SlicerEngine):
         ids = sorted(int(o.get("id")) for o in root.findall("object") if (o.get("id") or "").isdigit())
         if len(ids) != len(objects):
             return None
-        boxes = dict(zip(ids, objects))
+        index_of = {object_id: n for n, object_id in enumerate(ids)}
 
         placed: list[tuple[list[float], list[float], float]] = []
         scales: list[tuple[float, float, float]] = []
-        for item in items.findall("assemble_item"):
-            box = boxes.get(int(item.get("object_id") or -1)) if (item.get("object_id") or "").isdigit() else None
+        owners: list[int] = []
+        for item in self._assemble_items(items):
+            n = index_of.get(int(item.get("object_id") or -1)) if (item.get("object_id") or "").isdigit() else None
+            box = objects[n] if n is not None else None
             if box is None or box.file_min is None or box.file_max is None:
                 return None
+            # Off every plate means not printed, and what is not printed is not
+            # part of the toy the customer receives.
+            if box.object_id is not None and box.plate is None:
+                continue
 
             matrix = [float(v) for v in (item.get("transform") or "").split()]
             if len(matrix) != 12:
@@ -695,20 +926,35 @@ class OrcaSlicerEngine(SlicerEngine):
 
             lo = [float("inf")] * 3
             hi = [float("-inf")] * 3
+            # Row-vector convention, as the 3MF specification and render.py
+            # read it: p' = p · M + t, so output axis `axis` takes column
+            # `axis` of the 3×3 block. Until 1.10 this read the rows instead —
+            # the transpose, which is the inverse rotation. A translation does
+            # not care, and every matrix in the catalogue is one, so no size
+            # moved; a rotated piece would have landed mirrored about its own
+            # origin, next to the wrong neighbour.
             for corner in corners:
                 for axis in range(3):
                     placement = sum(
-                        matrix[axis * 3 + n] * corner[n] for n in range(3)
+                        corner[n] * matrix[n * 3 + axis] for n in range(3)
                     ) + matrix[9 + axis]
                     lo[axis] = min(lo[axis], placement)
                     hi[axis] = max(hi[axis], placement)
             # Material, not the box: the box of a hollow shell says how much room
             # a piece takes, and what is wanted here is which cluster *is* the
             # toy. Falls back to the box only where the binary reported no volume.
-            volume = box.volume_mm3 or max(
+            #
+            # **In the file's frame**, like the corners — not volume_mm3, which
+            # carries the build item's scale. Ranking by the scaled figure is
+            # what 1.8 shipped, and it turned the hydra into one piece: its
+            # largest loose part stands at 1.5 on the bed, which multiplied its
+            # material by 3.4 (94 044 → 317 399 mm³) and outweighed the 31
+            # glued pieces, half of which stand at 1.0 (115 145 → 235 745).
+            volume = box.file_volume_mm3 or max(
                 (hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]), 0.0
             )
             placed.append((lo, hi, volume))
+            owners.append(n)
 
         group = self._glued_group(placed)
         if group is None:
@@ -735,7 +981,36 @@ class OrcaSlicerEngine(SlicerEngine):
             size_y=round((hi[1] - lo[1]) * build[1] * factor, 3),
             size_z=round((hi[2] - lo[2]) * build[2] * factor, 3),
             part_count=len(group),
+            members=sorted({owners[i] for i in group}),
         )
+
+    @staticmethod
+    def _assemble_items(block: ET.Element) -> list[ET.Element]:
+        """One `assemble_item` per placed object instance.
+
+        **Not every element in the block is one.** Most files write exactly one
+        per object instance, each carrying an `instance_id`. Some write more:
+        Foxycat's every object appears four times — once with `instance_id="0"`
+        at the place it was assembled, and three times without one, at offsets
+        of a few tens of millimetres that are its parts' positions inside it.
+        Counted as pieces, those made one cat 36 parts out of 12 objects.
+
+        So for an object that has items naming their instance, only those count,
+        the first per instance. An object whose items name none is read as it
+        always was, every item a piece.
+        """
+        items = block.findall("assemble_item")
+        named = {item.get("object_id") for item in items if item.get("instance_id") is not None}
+
+        seen: set[tuple[str | None, str | None]] = set()
+        chosen: list[ET.Element] = []
+        for item in items:
+            key = (item.get("object_id"), item.get("instance_id"))
+            if key[0] in named and (key[1] is None or key in seen):
+                continue
+            seen.add(key)
+            chosen.append(item)
+        return chosen
 
     # How far apart two placed boxes may be and still count as touching.
     #
@@ -838,6 +1113,7 @@ class OrcaSlicerEngine(SlicerEngine):
             # cube of a uniform one — not with the factor.
             volume_mm3=cls._maybe_float(values.get("volume"), sx * sy * sz * factor ** 3),
             build_scale=build_scale,
+            file_volume_mm3=cls._maybe_float(values.get("volume")),
             facet_count=cls._maybe_int(values.get("number_of_facets")),
             manifold=cls._maybe_bool(values.get("manifold")),
             # Unrounded and unscaled, unlike the lengths above: these are what

@@ -18,7 +18,7 @@ import render
 from engines import registry
 from engines.base import EngineUnavailable, SliceFailed, SliceRequest
 
-app = FastAPI(title="FourD Slicer Service", version="1.9")
+app = FastAPI(title="FourD Slicer Service", version="1.10")
 
 WORKDIR_ROOT = os.environ.get("SLICER_WORKDIR", "/work")
 
@@ -48,6 +48,7 @@ async def slice_model(
     filament_profiles: str = Form(""),
     scale: float = Form(1.0),
     plate: int = Form(0),
+    plates: str = Form(""),
     brim: bool = Form(False),
 ) -> dict:
     engine = _engine(code)
@@ -66,6 +67,9 @@ async def slice_model(
             filament_profiles=[p for p in filament_profiles.split(";") if p],
             scale=scale,
             plate=plate,
+            # "1,3,5": only these plates, for a file whose plates are variants
+            # and a person chose which to print. Empty means `plate` decides.
+            plates=_plate_list(plates),
             brim=brim,
         )
         try:
@@ -187,6 +191,13 @@ async def render_model(
 #: a guard on the one request parameter that costs memory quadratically, so a
 #: typo cannot ask for a 100000-pixel canvas and take the service down with it.
 MAX_PICTURE_PX = 4000
+
+
+def _plate_list(value: str) -> list[int]:
+    try:
+        return [int(p) for p in value.replace(" ", "").split(",") if p]
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"plates must be a comma-separated list of numbers, got {value!r}")
 
 
 def _picture_size(value: int) -> int:

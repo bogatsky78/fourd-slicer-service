@@ -60,6 +60,7 @@ anything that only needs to know how big something is.
 | `filament_profiles` | string | no | `""` | `;`-separated profile names, one per slot. |
 | `scale` | number | no | `1.0` | See the warning about it below. |
 | `plate` | integer | no | `0` | `0` slices the whole file; a plate number slices only that plate. |
+| `plates` | string | no | `""` | Several plates, comma-separated and 1-based (`"1,3"`): only these are sliced, and every total is theirs. For a file whose plates are variants and a person chose which to print — see `model.layout`. A number the file does not have is a 422. Takes precedence over `plate`. |
 | `brim` | boolean | no | `false` | Off by default, so the grams describe the part and not a skirt around it. See below. |
 
 **The brim is off unless you ask for it.** Whatever the file's own `brim_type`
@@ -243,7 +244,8 @@ slicing, call it from a queue.
 | `max_plate_filaments` | int | **Colours standing on the busiest single plate.** |
 | `warnings[]` | list of string | What the engine complained about without refusing. |
 | `raw` | string, nullable | The tail of the engine's log for the last plate run. Diagnostics; do not parse it. |
-| `plates[]` | list | The same numbers, per plate — `index`, `weight_g`, `print_time_sec`, `filaments[]`, `filament_changes`, `warnings[]`, `adjustments[]`. |
+| `plates[]` | list | The same numbers, per plate — `index`, `weight_g`, `print_time_sec`, `filaments[]`, `filament_changes`, `supports`, `warnings[]`, `adjustments[]`. |
+| `plates_sliced` | list of int | The plates the totals are made of, when the request named some with `plates`; empty for a whole-file slice. |
 | `model` | object | Geometry. See below. |
 
 **`max_plate_filaments`, not `filament_count`, is what a head count is compared
@@ -259,6 +261,18 @@ G-code, and it comes from nowhere else — not from the engine's summary, not fr
 its metadata. A caller that charges for purge needs it: how many grams a change
 costs is a property of the machine, and how many changes there will be is a
 property of the print, and only the thing that sliced it knows the second half.
+
+**`plates[].supports`** is the grams of every support the plate prints, largest
+first — one entry per support an operator snaps off by hand. Empty is a plate
+printed without supports; null, that the G-code could not be read for it. Like
+`filament_changes` it comes out of the G-code and nowhere else: the engine's
+summary reports a plate's material as one number per filament. Support
+extrusions are collected into cells 2 mm square in plan and one layer tall, and
+touching cells are one support — a tree's branches meet its trunk on the way
+down, so a tree is one entry; two trees a few millimetres apart are two.
+Interface layers count with the support they cap. On the reference corgi: one
+tree from 0.2 to 27 mm, 0.93 g, and the count does not move between cells of
+0.5 and 4 mm.
 
 **`plates[].adjustments`** lists what had to be changed before that plate would
 slice at all — moving a purge tower back onto the bed, or into a free corner
@@ -292,12 +306,16 @@ Returned identically by `/slice` and `/inspect`.
   "model": {
     "objects": [
       { "size_x": 60.96, "size_y": 80.644, "size_z": 81.382,
-        "volume_mm3": 144072.25, "facet_count": 1159988, "manifold": true }
+        "volume_mm3": 144072.25, "facet_count": 1159988, "manifold": true,
+        "object_id": 2, "plate": 1, "in_assembly": true }
     ],
     "object_count": 16,
     "total_volume_mm3": 276484.7,
     "size_x": 60.96, "size_y": 80.644, "size_z": 81.382,
-    "assembly": { "size_x": 94.95, "size_y": 80.64, "size_z": 141.0, "part_count": 15 }
+    "assembly": { "size_x": 94.95, "size_y": 80.64, "size_z": 141.0, "part_count": 15 },
+    "plates": [ { "index": 1, "name": null, "object_count": 3 } ],
+    "layout": "assembly",
+    "plates_alike": null
   }
 }
 ```
@@ -320,10 +338,16 @@ this API, so:
 | `objects[].volume_mm3` | number, nullable | Material, not the box. |
 | `objects[].facet_count` | int, nullable | Triangles. |
 | `objects[].manifold` | bool, nullable | **False means the volume, and therefore any weight derived from it, cannot be trusted.** |
-| `object_count` | int | `len(objects)`. |
-| `total_volume_mm3` | number, nullable | Every piece's material summed. |
+| `objects[].object_id` | int, nullable | The object's id in the file — the id `plates` and `<assemble>` name it by. Null for a file with no ids (a bare mesh). |
+| `objects[].plate` | int, nullable | The plate the object stands on, 1-based. **Null means on no plate**: the author parked it off the beds, nothing prints it, and it is left out of every aggregate below and of `assembly`. A file that says nothing about plates prints as one, so its objects are on plate 1. |
+| `objects[].in_assembly` | bool, nullable | Whether the object is one of the `assembly.part_count` pieces. False marks a loose extra that is still printed; null, that there is no assembly to belong to. |
+| `object_count` | int | Objects on a plate — `objects[]` minus the ones with `plate: null`. |
+| `total_volume_mm3` | number, nullable | Every printed piece's material summed. |
 | `size_x` / `size_y` / `size_z` | number, nullable | The **largest single object**, as a convenience for callers that want one number without sorting the list. Not the model. |
 | `assembly` | object, **nullable** | The model with its pieces put together. See below. |
+| `plates[]` | list | The plates as the file lays them out, before anything is sliced: `index`, the author's `name` for the plate (nullable, free text), `object_count`, `kind`, `copies` and `models[]` — see below. Empty for a file with no plate list. |
+| `layout` | string, nullable | How the plates relate — see below: `single`, `assembly` or `separate`. Null when the file could not be read for it. |
+| `plates_alike` | bool, nullable | For `separate` only: every plate holds the same kind of model. **A hint, not an answer** — see below. |
 
 **`objects[]` is a list and not a box on purpose.** Reporting one bounding box
 over all of them would answer a question nobody asks: the pieces are printed
@@ -331,6 +355,60 @@ apart and packed apart, and the extent of their arrangement on the print bed is
 an artefact of how somebody laid them out. Their coordinates are local to each
 object and carry no layout, so they cannot be unioned into anything meaningful
 anyway.
+
+### `layout` — one model across the plates, or a model on each
+
+Three answers, and only the first two are settled by geometry:
+
+| `layout` | Means | Catalogue example |
+|---|---|---|
+| `single` | One plate. | every `*AMS.3mf` |
+| `assembly` | Pieces standing on **different** plates glue into one model: the `assembly` group spans more than one plate. | the hydra — 31 glued pieces over 7 plates |
+| `separate` | Every plate holds a model, or models, of its own: the glued group stays on one plate, or there is none. | Foxycat — 12 plates, one cat on each |
+
+**`separate` is where geometry stops.** Twelve cats on twelve plates are either
+twelve variants to pick one from or a set of twelve to print, and the file reads
+the same either way: that is the author's intent, not a fact about the shapes.
+So the service does not decide it. It offers two hints and leaves the choice to
+whoever is selling or buying the print:
+
+- `plates_alike` — true when every plate shares a part name with every other
+  (each Foxycat plate holds a `cat body.stl` with its eyes); false when they
+  share none;
+- `plates[].name` — the author's label for each plate (`AMS`, `1C Keyring -
+  Mini`), as written.
+
+A file whose pieces are a real assembly but whose `<assemble>` block was never
+filled in also reads as `separate`, with `plates_alike: false` — the split corgi
+in the reference catalogue is one. The file does not say how its pieces go
+together, so neither can the answer.
+
+### `plates[].models` — what comes off a plate as one thing
+
+Each plate's objects are placed where the file prints them, split into their
+shells (the connected pieces of their meshes), and the shells related pairwise:
+
+| Two shells… | Are |
+|---|---|
+| touch or pass through each other (gap under 0.1 mm) | one model — an AMS model's colour regions, an eye sunk into a head |
+| interlock — boxes overlapping — with 0.1 to 1 mm of air everywhere | one **flexi** model — a print-in-place joint |
+| anything else | separate models |
+
+Both limits are the shop's (flexi is a gap of 0.1–1 mm, AMS a gap of zero or
+less). The reference flexi bear's two joints keep 0.170 and 0.178 mm.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `plates[].kind` | string | `ams` — the plate's objects use more than one palette slot, so it prints with a prime tower; `simple` — one colour, no tower. Read from the file, no slice needed. |
+| `plates[].copies` | string, nullable | `multi` — several models, all the same shape (same shells, triangles and material); `one` — a single model, or several different ones. |
+| `plates[].models[]` | list, nullable | One entry per thing that comes off the plate in one piece: `kind` (`part`, `ams` or `flexi`), `object_ids` it is made of, and `shells`. |
+
+Distances are vertex to triangle, both ways round, which finds the gap between
+any face and any corner facing it — the shape a clearance has — even on a coarse
+CAD mesh whose flat faces carry no vertices. A part pushed into another is caught
+separately, by testing a few of its vertices for being inside the other. This
+reads the meshes, so it costs seconds: 11–13 s on the corgi and the bear, most
+of it parsing.
 
 ### `assembly` — and what `null` there means
 
@@ -354,6 +432,12 @@ overstate the model badly — one retriever measures 95 mm assembled and 131 mm
 with its coffee mug parked ten millimetres off its paws, and a decorative chest
 goes from 99 mm to 450 mm. So `assembly.size_*` is a **lower bound on what
 ships**: it is the model, not the model plus everything else in the box.
+
+**Left out of the model is not left off the plate.** In every file of the
+reference catalogue the extras stand on a plate like any other piece — the
+hydra's nine are printed, weighed and timed with the rest. They are the objects
+with `in_assembly: false` and a `plate`; only `plate: null` means not printed.
+Pieces off every plate never enter the grouping at all.
 
 Accuracy, on the one model in the reference catalogue that has been measured with
 a ruler: computed 94.95 × 80.64 × 141.0 mm against a printed and glued 140 mm of
@@ -457,6 +541,19 @@ and is reported in every response.
   of the bed. A one-filament project whose flush matrix is a single cell no
   longer crashes the engine on a multi-nozzle machine; its weight is what the
   same file always gave on a one-nozzle one. No field changed shape.
+
+- **1.10** says what stands on each plate: `objects[].object_id`, `plate` and
+  `in_assembly`; `model.plates[]` with names, `kind`, `copies` and `models[]`;
+  `model.layout` and `plates_alike`; `plates[].supports`; and the `plates`
+  request parameter. Two fixes move numbers. The assembly ranks its groups by
+  material in the file's frame again — 1.8 ranked by scaled material, which
+  turned the hydra into one piece (part_count 1, 69.7 × 105.6 × 109.3 mm) instead
+  of 31 (98.2 × 107.5 × 183.9) — and a file that lists an object several times
+  in `<assemble>` counts it once per instance. A rotated assembly piece is now
+  turned the way the 3MF specification turns it; every matrix in the reference
+  catalogue is a translation, so no size there moved. Objects on no plate are
+  left out of `object_count`, `total_volume_mm3`, `size_*` and `assembly`; none
+  of the 29 reference files has one.
 
 Fields are added, not repurposed. The one thing a caller must handle is the
 difference between a field being **absent** — an older service that has never
