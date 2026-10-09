@@ -141,8 +141,14 @@ async def render_model(
     width: int = Form(900),
     height: int = Form(900),
     stage: str | None = Form(None),
+    plate: int | None = Form(None),
 ) -> dict:
     """One picture of the model, and the name of where it came from.
+
+    With `plate`, one picture of that plate instead (1.10): the slicer's own
+    thumbnail of it out of the archive, else our drawing of what stands on it.
+    A plate the file does not have is a 422 like any other file nothing could
+    draw.
 
     **Not under `/engines/{code}/`**, unlike everything else that reads a model:
     not one stage of the cascade touches a slicer binary. Two lift a picture the
@@ -161,6 +167,8 @@ async def render_model(
     3MF that was just uploaded to produce it.
     """
     width, height = _picture_size(width), _picture_size(height)
+    if plate is not None and plate < 1:
+        raise HTTPException(status_code=422, detail=f"plate numbers start at 1, got {plate}")
 
     os.makedirs(WORKDIR_ROOT, exist_ok=True)
     workdir = tempfile.mkdtemp(dir=WORKDIR_ROOT, prefix="render-")
@@ -170,12 +178,15 @@ async def render_model(
             shutil.copyfileobj(model.file, fh)
 
         try:
-            picture = render.render(source, width, height, stage)
+            picture = render.render(source, width, height, stage, plate)
         except render.RenderFailed as exc:
-            raise HTTPException(status_code=422, detail={"message": str(exc), "stage": stage}) from exc
+            raise HTTPException(
+                status_code=422, detail={"message": str(exc), "stage": stage, "plate": plate}
+            ) from exc
 
         return {
             "stage": picture.stage,
+            "plate": plate,
             "assembled": picture.assembled,
             "format": "png",
             "width": picture.width,

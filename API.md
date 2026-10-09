@@ -115,6 +115,7 @@ Returns `engine`, `engine_version` and the same `model` block a slice returns.
 | `width` | int | `900` | Widest the picture may be, in pixels. 16 to 4000. |
 | `height` | int | `900` | Tallest the picture may be, in pixels. 16 to 4000. |
 | `stage` | string | *(cascade)* | Force one stage instead of walking the cascade. |
+| `plate` | int | *(none)* | A picture of this plate instead of the model (1.10). Numbers start at 1. |
 
 The picture is fitted inside `width` x `height` keeping its shape, and is never
 enlarged past its own size — an embedded 680x510 thumbnail comes back at 680x510
@@ -197,6 +198,25 @@ triangles: 985k triangles in 5 s, 11.1M in 38 s, both at 900x900. Memory goes
 the same way and is the real ceiling — 0.8 GB and 1.7 GB for those two. Like
 slicing, call it from a queue.
 
+### One plate: `plate` (1.10)
+
+With `plate=N` the picture is of that plate, not of the model, and the cascade is
+a different, shorter one:
+
+| `stage` | Source | What it is |
+|---|---|---|
+| `author_plate` | `Metadata/plate_N.png`, as the plate's `thumbnail_file` in `model_settings.config` names it | The slicer's own picture of the plate as the designer laid it out, cropped to what is drawn and laid on white. Bambu Studio and Orca save one for every plate but do not always redraw it: **a thumbnail another plate shares byte for byte is skipped**, since two plates with different objects cannot look the same. Foxycat's twelve plates carry four distinct pictures, the only such file in the catalogue, and are drawn. |
+| `geometry` | The meshes of the objects standing on that plate, drawn here | Every object on the plate, where it stands — no assembling, and no picking "the model" out of the extras: a plate is exactly what is on it. `assembled` is `false`. |
+
+It exists so that a person choosing which plates of a file to print can look at
+them; a plate number says nothing without a slicer open next to it. All 29 files
+in the shop's catalogue carry `plate_N.png` for every plate (2026-10-07), so the
+second stage is for projects saved by something else. A plate the file does not
+have is the usual 422, with `plate` added to `detail`. `plate` is echoed in the
+response. Timing: `author_plate` 0.1 s; `geometry` 4.5 s for a single-plate
+corgi, 9.5 s for a Foxycat plate, 20 s for plate 3 of the hydra, 40 s for
+plate 9 of the turtle, at 600x600 (Foxycat at 360x360).
+
 ## The slice response
 
 ```json
@@ -267,8 +287,10 @@ first — one entry per support an operator snaps off by hand. Empty is a plate
 printed without supports; null, that the G-code could not be read for it. Like
 `filament_changes` it comes out of the G-code and nowhere else: the engine's
 summary reports a plate's material as one number per filament. Support
-extrusions are collected into cells 2 mm square in plan and one layer tall, and
-touching cells are one support — a tree's branches meet its trunk on the way
+extrusions are collected into cells 2 mm square in plan and one support level
+tall — the next height at which support is printed, if within 1 mm, not the next
+layer number, since a plate of objects with different layer heights interleaves
+its Zs — and touching cells are one support — a tree's branches meet its trunk on the way
 down, so a tree is one entry; two trees a few millimetres apart are two.
 Interface layers count with the support they cap. On the reference corgi: one
 tree from 0.2 to 27 mm, 0.93 g, and the count does not move between cells of
@@ -500,7 +522,7 @@ that. A **named** refusal is the exception and arrives at once: `off_bed` and
 `conflict` are deterministic, so repeating them would only spend slices to
 reach the same word.
 
-A render that produces nothing returns `detail` as `{"message", "stage"}`, where
+A render that produces nothing returns `detail` as `{"message", "stage", "plate"}`, where
 `message` lists what each stage was asked and what it said. It takes a file with
 no pictures in it **and** no geometry we could read, so in practice it means the
 upload is not a 3MF at all. An out-of-range `width` or `height` returns `detail`
@@ -544,8 +566,9 @@ and is reported in every response.
 
 - **1.10** says what stands on each plate: `objects[].object_id`, `plate` and
   `in_assembly`; `model.plates[]` with names, `kind`, `copies` and `models[]`;
-  `model.layout` and `plates_alike`; `plates[].supports`; and the `plates`
-  request parameter. Two fixes move numbers. The assembly ranks its groups by
+  `model.layout` and `plates_alike`; `plates[].supports`; the `plates`
+  request parameter of the slice; and `plate` on `/render`, a picture of one
+  plate. Two fixes move numbers. The assembly ranks its groups by
   material in the file's frame again — 1.8 ranked by scaled material, which
   turned the hydra into one piece (part_count 1, 69.7 × 105.6 × 109.3 mm) instead
   of 31 (98.2 × 107.5 × 183.9) — and a file that lists an object several times

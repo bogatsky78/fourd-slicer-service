@@ -19,6 +19,23 @@ the embedded pictures out is three lines, and splitting a cascade across two
 languages so that one language owns steps 1–2 and the other step 3 buys nothing
 and costs a caller the ability to say "give me a picture" and be done.
 
+**One plate** (1.10) is a different question with its own, shorter cascade —
+`plate=N`:
+
+1. `author_plate` — the picture of that plate the designer's slicer saved,
+   `Metadata/plate_N.png`, as named by the plate's `thumbnail_file` in
+   `model_settings.config`. Bambu Studio and Orca write one for every plate, and
+   every file in the shop's catalogue carries them (29 of 29, 2026-10-07) —
+   but not always up to date, so one another plate shares byte for byte is
+   skipped (see `_author_plate`).
+2. `geometry` — our own drawing of the objects standing on that plate, where
+   they stand. No assembling and no "which cluster is the model": a plate is
+   exactly what is on it, alternatives and spares included.
+
+It exists so that choosing which plates of a file to print is done by looking
+at them rather than by number — a plate number says nothing without the slicer
+open next to it.
+
 The stage is reported alongside the image because it changes what the picture
 *is*: a studio render of the finished toy, a photo of somebody's print, or our
 own untextured geometry. A caller deciding whether to show it to a customer
@@ -43,6 +60,9 @@ from PIL import Image
 
 #: In cascade order. `author_*` come out of the archive, `geometry` is drawn.
 STAGES = ("author_render", "author_thumbnail", "geometry")
+
+#: The cascade for one plate.
+PLATE_STAGES = ("author_plate", "geometry")
 
 AUTHOR_RENDER = "Auxiliaries/Model Pictures/render.webp"
 AUTHOR_THUMBNAIL = "Auxiliaries/.thumbnails/thumbnail_middle.png"
@@ -74,21 +94,33 @@ class Render:
     assembled: bool | None = None
 
 
-def render(path: str, width: int = 900, height: int = 900, stage: str | None = None) -> Render:
+def render(
+    path: str,
+    width: int = 900,
+    height: int = 900,
+    stage: str | None = None,
+    plate: int | None = None,
+) -> Render:
     """Best available picture of `path`, at most `width` x `height`.
 
     `stage` forces one stage instead of walking the cascade — the way to ask
     "what would our own renderer make of this file" about a model that has a
     perfectly good studio render sitting in it.
+
+    `plate` asks for one plate instead of the model, through `PLATE_STAGES`.
     """
-    if stage is not None and stage not in STAGES:
+    cascade = PLATE_STAGES if plate is not None else STAGES
+    if stage is not None and stage not in cascade:
         raise RenderFailed(f"unknown render stage: {stage}")
 
-    wanted = (stage,) if stage else STAGES
+    wanted = (stage,) if stage else cascade
     problems: list[str] = []
     for name in wanted:
         try:
-            result = _STAGES[name](path, width, height)
+            if plate is not None:
+                result = _PLATE_STAGES[name](path, width, height, plate)
+            else:
+                result = _STAGES[name](path, width, height)
         except Exception as exc:  # noqa: BLE001 - a stage that fails is a stage we skip
             problems.append(f"{name}: {exc}")
             continue
@@ -112,6 +144,125 @@ def _embedded(name: str):
             return _encode(image.convert("RGB"), width, height, _EMBEDDED_STAGE[name])
 
     return stage
+
+
+def _author_plate(path: str, width: int, height: int, plate: int) -> Render | None:
+    """The slicer's own picture of one plate, out of the archive.
+
+    The name comes from the plate's `thumbnail_file` when the file states it and
+    is the conventional `Metadata/plate_N.png` otherwise.
+
+    **A thumbnail another plate shares byte for byte is not trusted.** The
+    slicer writes them when the project is saved and does not always redraw
+    them: Foxycat's twelve plates — full size and Mini, plain, keychain and
+    keyring — carry four distinct pictures, so the keychain plate shows the
+    plain cat and the Mini the full-size one. Two plates with different objects
+    on them cannot look identical, so a shared picture describes at most one of
+    them, and the drawing takes over.
+
+    The picture is RGBA on a transparent background, so it is laid on white
+    (dropping the alpha as the other embedded stages do would put it on black)
+    and cropped to what is drawn: the slicer frames the whole bed, and a small
+    model ends up a speck in the middle of a tile.
+    """
+    with zipfile.ZipFile(path) as zf:
+        names = set(zf.namelist())
+        plates = _plates(zf, names)
+        if plates and plate not in plates:
+            return None
+        thumbnails = {
+            index: (info.get("thumbnail") or f"Metadata/plate_{index}.png")
+            for index, info in (plates or {plate: {}}).items()
+        }
+        name = thumbnails[plate]
+        if name not in names:
+            return None
+        raw = zf.read(name)
+        for index, other in thumbnails.items():
+            if index != plate and other != name and other in names and zf.read(other) == raw:
+                return None
+
+    with Image.open(io.BytesIO(raw)) as image:
+        image = image.convert("RGBA")
+        box = image.getchannel("A").getbbox()
+        if box is not None:
+            pad = max(4, (box[2] - box[0] + box[3] - box[1]) // 20)
+            box = (
+                max(0, box[0] - pad),
+                max(0, box[1] - pad),
+                min(image.width, box[2] + pad),
+                min(image.height, box[3] + pad),
+            )
+            image = image.crop(box)
+        canvas = Image.new("RGB", image.size, (255, 255, 255))
+        canvas.paste(image, mask=image.getchannel("A"))
+
+    return _encode(canvas, width, height, "author_plate")
+
+
+def _plate_geometry(path: str, width: int, height: int, plate: int) -> Render | None:
+    """What stands on one plate, drawn where it stands."""
+    with zipfile.ZipFile(path) as zf:
+        names = set(zf.namelist())
+        if ROOT_MODEL not in names:
+            return None
+
+        plates = _plates(zf, names)
+        if plates and plate not in plates:
+            return None
+
+        palette = _palette(zf, names)
+        objects, builds = _read_model(zf, names)
+        if plates:
+            on_plate = plates[plate]["objects"]
+            builds = [item for item in builds if item["object_id"] in on_plate]
+        elif plate != 1:
+            # A project with no plate list is one plate.
+            return None
+        if not objects or not builds:
+            return None
+
+        meshes = _flatten(zf, names, objects, builds, palette)
+
+    if not meshes:
+        return None
+
+    placements = [item["matrix"] for item in builds]
+    result = _encode(_draw(meshes, placements, width, height), width, height, "geometry")
+    result.assembled = False
+
+    return result
+
+
+def _plates(zf: zipfile.ZipFile, names: set[str]) -> dict[int, dict]:
+    """Per plate number: the object ids on it and the name of its picture.
+
+    Empty when the file has no plate list, which a caller reads as "one plate,
+    everything on it" — the same reading the engine gives such a file.
+    """
+    if MODEL_SETTINGS not in names:
+        return {}
+    try:
+        root = ET.fromstring(zf.read(MODEL_SETTINGS))
+    except (ET.ParseError, OSError):
+        return {}
+
+    plates: dict[int, dict] = {}
+    for node in root.findall("plate"):
+        meta = {m.get("key"): m.get("value") for m in node.findall("metadata")}
+        if not (meta.get("plater_id") or "").isdigit():
+            continue
+        plates[int(meta["plater_id"])] = {
+            "thumbnail": meta.get("thumbnail_file") or None,
+            "objects": {
+                int(m.get("value"))
+                for instance in node.findall("model_instance")
+                for m in instance.findall("metadata")
+                if m.get("key") == "object_id" and (m.get("value") or "").isdigit()
+            },
+        }
+
+    return plates
 
 
 def _encode(image: Image.Image, width: int, height: int, stage: str) -> Render:
@@ -913,4 +1064,9 @@ _STAGES = {
     "author_render": _embedded(AUTHOR_RENDER),
     "author_thumbnail": _embedded(AUTHOR_THUMBNAIL),
     "geometry": _geometry,
+}
+
+_PLATE_STAGES = {
+    "author_plate": _author_plate,
+    "geometry": _plate_geometry,
 }
