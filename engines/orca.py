@@ -97,6 +97,9 @@ TOWER_PARTY = "WipeTower"
 # off for it. The name of the object is in the engine's log only.
 SLICE_FAILED = -100
 FLOATING_LINE = re.compile(r"It seems object (.+?) has floating regions")
+# Written whenever the plate's supports are trees; see the last remedy in
+# _remedy() for why it matters.
+TREE_SUPPORT_LINE = re.compile(r"Tree support overhang detection done")
 
 
 @dataclasses.dataclass
@@ -331,7 +334,9 @@ class OrcaSlicerEngine(SlicerEngine):
             )
 
         retries = tried.count("retry")
-        if output_path and retries:
+        # Only when the run that worked was itself a plain retry: one that
+        # needed a remedy after the retries ran out says so on its own line.
+        if output_path and retries and tried[-1] == "retry":
             adjustments.append(
                 f"the engine refused this plate {retries} "
                 f"time{'s' if retries > 1 else ''} for no reason it would name, "
@@ -360,7 +365,7 @@ class OrcaSlicerEngine(SlicerEngine):
 
     # Each named remedy is one thing worth changing about a refused plate,
     # tried at most once and in this order.
-    REMEDIES = ("conflict", "tower", "labels", "supports", "raft")
+    REMEDIES = ("conflict", "tower", "labels", "supports", "raft", "normal_supports")
 
     # How many times a plate refused for no nameable reason is simply run
     # again, unchanged. See _remedy() for why this number and not a smaller one.
@@ -488,6 +493,30 @@ class OrcaSlicerEngine(SlicerEngine):
             # Nothing to change, and no sentence yet: how many runs it took is
             # only worth reporting once one of them works.
             return _Remedy(kind="retry", argv=[], note="")
+
+        # **Trees that never finish.** The goblin's plate 4 refuses with a bare
+        # `-100` on every run, seven of seven: the log goes through tree
+        # supports and dies at the next stage without a word. Supports off
+        # refuses too — the part needs them — and the same supports drawn the
+        # classic way, `normal(auto)`, slice two runs of two.
+        #
+        # This is the one remedy that sits *after* the retries, and on purpose.
+        # Tree supports slice fine nearly everywhere, and a plate that refuses
+        # them only now and then is better served by the retry above, which
+        # keeps the supports the author chose and their grams. Only a plate
+        # that refused all the retries gets a different kind of support, and
+        # that is reported: the weight of the supports is not the weight of the
+        # trees the author would have printed.
+        if (
+            code == SLICE_FAILED
+            and "normal_supports" not in tried
+            and TREE_SUPPORT_LINE.search(self._engine_log(workdir))
+        ):
+            return _Remedy(
+                kind="normal_supports",
+                argv=["--support-type=normal(auto)"],
+                note="tree supports refused on every run; sliced with normal supports instead",
+            )
         return None
 
     def _run_slice(

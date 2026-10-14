@@ -300,7 +300,8 @@ tree from 0.2 to 27 mm, 0.93 g, and the count does not move between cells of
 slice at all — moving a purge tower back onto the bed, or into a free corner
 of it when the engine found it across a part, or switching supports on (and,
 if that is not enough, a raft) for a plate the engine refused because an object
-would start in mid-air, for instance. It is reported
+would start in mid-air, or normal supports in place of tree ones the engine
+refused on every run, for instance. It is reported
 rather than done quietly, because it means the file describes a print this
 machine cannot run as the author laid it out.
 
@@ -590,6 +591,10 @@ and is reported in every response.
   object starting in mid-air, and a two-layer raft was added when supports
   alone were not enough. Both add the grams the print would really take. No
   field changed shape.
+- **1.12** adds one more thing `plates[].adjustments` can say: tree supports
+  refused the plate on every run, and it was sliced with normal supports
+  instead. Only a plate that refused all retries is changed this way, so no
+  number a caller already had moves. No field changed shape.
 
 Fields are added, not repurposed. The one thing a caller must handle is the
 difference between a field being **absent** — an older service that has never
