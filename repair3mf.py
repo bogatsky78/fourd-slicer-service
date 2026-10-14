@@ -19,6 +19,31 @@ without them the slicer aborts or crashes:
    one-nozzle P2S. Dropped rather than padded: with one filament nothing is
    ever flushed, so no weight can move, and the slicer fills in its own.
 
+4. A plate saved with `filament_map_mode` "Auto For Flush" (every Bambu
+   project carries it, per plate in model_settings.config and once for the
+   project) lets the slicer re-decide which head prints which filament after
+   pre-slicing. On the four-head U1 profile that re-decision corrupts the heap:
+   `std::bad_alloc`, SIGSEGV or SIGABRT, right after the log line
+   `filament maps changed after pre-slicing`, on seven runs in ten for the same
+   plate. So the assignment is fixed here instead ("Manual"), and it has to be
+   fixed to something true: the file's own `filament_map` is the author's
+   machine, which for a one-nozzle Bambu means every filament on head 1, and a
+   two-colour plate read that way becomes a single-nozzle colour swap with a
+   purge tower the U1 never builds. Filament k goes to head k, round the heads
+   the machine has — what a tool changer does, and with the per-plate
+   renumbering in the engine every plate's colours are 1..k anyway.
+   `filament_printable` goes with it: it is a bit mask of the heads a filament
+   may use, and the author's two-head H2C wrote `3` — heads 1 and 2 — so a
+   filament on head 3 is refused with `-68`, "Some filaments cannot be printed
+   on the extruder mapped to". Widened to every head the machine has. (Widening
+   it alone, leaving the mapping on Auto, does not stop the crash: 1 run in 8.)
+
+5. Settings an object carries for itself in model_settings.config beat the
+   ones the command line gives the whole run. `object_settings` overwrites
+   such a key wherever an object states it; the one caller uses it for the
+   brim, whose `--brim-type=no_brim` five eyes of a pig ignored with
+   their own `outer_only` and died inside `Generating skirt & brim`.
+
 Deleting the embedded configs instead of repairing them is NOT an option: with
 project_settings.config absent the slicer segfaults even earlier, before it
 reaches the file.
@@ -48,6 +73,11 @@ OUT_OF_RANGE = {
 NIL = "nil"
 
 FLUSH_MATRIX = "flush_volumes_matrix"
+
+MAP_MODE = "filament_map_mode"
+MAP_MODE_MANUAL = "Manual"
+PLATE_MAP_MODE = re.compile(r'(key="filament_map_mode"\s+value=")([^"]*)(")')
+PLATE_MAPS = re.compile(r'(key="filament_maps"\s+value=")([^"]*)(")')
 
 
 def _fix_ranges(cfg: dict) -> list[str]:
@@ -81,6 +111,37 @@ def _fix_flush_matrix(cfg: dict) -> list[str]:
     return []
 
 
+def _head_map(count: int, heads: int) -> list[str]:
+    """Filament k on head k, wrapping round the heads; see point 4 above."""
+    return [str(i % heads + 1) for i in range(count)]
+
+
+def _fix_map_mode(cfg: dict, heads: int | None) -> list[str]:
+    """Pin the project's filament-to-head assignment; see point 4 above."""
+    if not heads or MAP_MODE not in cfg:
+        return []
+    count = len(cfg.get("filament_colour") or cfg.get("filament_map") or [])
+    cfg[MAP_MODE] = MAP_MODE_MANUAL
+    cfg["filament_map"] = _head_map(count, heads)
+    changed = [MAP_MODE, "filament_map"]
+    if "filament_printable" in cfg:
+        cfg["filament_printable"] = [str((1 << heads) - 1)] * count
+        changed.append("filament_printable")
+    return changed
+
+
+def _fix_plate_map_mode(settings: str, heads: int | None) -> str:
+    """The same per plate, which is the one that matters: the project value
+    alone set to Manual leaves the crash exactly as frequent."""
+    if not heads:
+        return settings
+    settings = PLATE_MAP_MODE.sub(lambda m: f"{m.group(1)}{MAP_MODE_MANUAL}{m.group(3)}", settings)
+    return PLATE_MAPS.sub(
+        lambda m: m.group(1) + " ".join(_head_map(len(m.group(2).split()), heads)) + m.group(3),
+        settings,
+    )
+
+
 def _fix_filament_config(cfg: dict) -> dict:
     """Replace "nil" placeholders with the first real value in the same array and
     drop the inherits pointer at a preset the target slicer does not have."""
@@ -107,6 +168,21 @@ def _apply_overrides(cfg: dict, overrides: dict) -> list[str]:
         cfg[key] = value
         changed.append(key)
     return changed
+
+
+def _rewrite_object_settings(settings: str, values: dict) -> str:
+    """Overwrite `values` wherever the file states them; see point 5 above.
+
+    Only keys already present are touched: an object that says nothing about a
+    key inherits it from the run, which is the behaviour being asked for.
+    """
+    for key, value in values.items():
+        settings = re.sub(
+            r'(key="%s"\s+value=")[^"]*(")' % re.escape(key),
+            lambda m: f"{m.group(1)}{value}{m.group(2)}",
+            settings,
+        )
+    return settings
 
 
 def _rewrite_extruders(settings: str, per_object: dict) -> str:
@@ -147,11 +223,13 @@ def repair(
     dst: str,
     project_overrides: dict | None = None,
     object_extruders: dict | None = None,
+    object_settings: dict | None = None,
+    heads: int | None = None,
 ) -> dict:
     """Write a repaired copy of `src` to `dst`. Returns a small report.
 
     `project_overrides` are applied to project_settings.config in the same pass,
-    and `object_extruders` to model_settings.config, so neither costs anything
+    and `object_extruders` and `object_settings` to model_settings.config, so none costs anything
     extra — rewriting the archive a second time would mean recompressing tens of
     megabytes of mesh for the sake of one JSON key.
     """
@@ -164,7 +242,7 @@ def repair(
             )
         project = json.loads(zin.read(PROJECT_CONFIG))
 
-    fixed_keys = _fix_ranges(project) + _fix_flush_matrix(project)
+    fixed_keys = _fix_ranges(project) + _fix_flush_matrix(project) + _fix_map_mode(project, heads)
     overridden_keys = _apply_overrides(project, project_overrides or {})
     touched_filament_configs = []
 
@@ -175,13 +253,10 @@ def repair(
             name = item.filename
             if name == PROJECT_CONFIG:
                 continue  # rewritten below
-            if name == MODEL_CONFIG and object_extruders:
-                zout.writestr(
-                    item,
-                    _rewrite_extruders(
-                        zin.read(name).decode("utf-8"), object_extruders
-                    ),
-                )
+            if name == MODEL_CONFIG:
+                settings = _fix_plate_map_mode(zin.read(name).decode("utf-8"), heads)
+                settings = _rewrite_object_settings(settings, object_settings or {})
+                zout.writestr(item, _rewrite_extruders(settings, object_extruders or {}))
                 continue
             if name.startswith(FILAMENT_CONFIG_PREFIX):
                 cfg = _fix_filament_config(json.loads(zin.read(name)))

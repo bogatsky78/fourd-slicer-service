@@ -298,7 +298,9 @@ tree from 0.2 to 27 mm, 0.93 g, and the count does not move between cells of
 
 **`plates[].adjustments`** lists what had to be changed before that plate would
 slice at all — moving a purge tower back onto the bed, or into a free corner
-of it when the engine found it across a part, for instance. It is reported
+of it when the engine found it across a part, or switching supports on (and,
+if that is not enough, a raft) for a plate the engine refused because an object
+would start in mid-air, for instance. It is reported
 rather than done quietly, because it means the file describes a print this
 machine cannot run as the author laid it out.
 
@@ -577,6 +579,17 @@ and is reported in every response.
   catalogue is a translation, so no size there moved. Objects on no plate are
   left out of `object_count`, `total_volume_mm3`, `size_*` and `assembly`; none
   of the 29 reference files has one.
+- **1.11** makes sixteen refused plates of one author's catalogue slice. A
+  Bambu project's filament-to-head assignment is pinned (filament k on head k)
+  instead of left to the engine, which corrupted its heap re-deciding it on a
+  four-head machine; an object's own brim setting is overwritten with the
+  run's, so `brim=false` now holds for objects that brim themselves — this
+  **moves numbers**: one reference file with a per-object brim on every plate
+  went from 138.46 g to 137.28 g. And `plates[].adjustments` can say two more
+  things: supports were switched on for a plate the engine refused over an
+  object starting in mid-air, and a two-layer raft was added when supports
+  alone were not enough. Both add the grams the print would really take. No
+  field changed shape.
 
 Fields are added, not repurposed. The one thing a caller must handle is the
 difference between a field being **absent** — an older service that has never

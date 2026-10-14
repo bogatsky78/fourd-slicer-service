@@ -73,13 +73,15 @@ PLATE_NOT_INSIDE = -50
 # either stream, which is why every run is now asked to write one.
 GCODE_CONFLICT = -101
 
-# The engine's own log, asked for on every run with `--debug 3 --logfile`. Three
+# The engine's own log, asked for on every run with `--debug 4 --logfile`. Four
 # things live only there and nowhere on stdout or stderr: which two things a
 # `-101` found crossing, whether the plate was moved to fit a smaller bed than
-# the file's, and where the engine thinks the prime tower is. Under 300 lines
-# per plate, deleted with the rest of the working directory.
+# the file's, where the engine thinks the prime tower is, and which object a
+# `-100` found floating. The last one is a status message the engine logs only
+# from level 4 up, which is why the level is 4 and not 3: a few thousand lines,
+# about 350 KB on a full plate, deleted with the rest of the working directory.
 ENGINE_LOG = "engine.log"
-ENGINE_LOG_LEVEL = "3"
+ENGINE_LOG_LEVEL = "4"
 CONFLICT_LINE = re.compile(r"gcode path conflicts found between (.+?)\s*$", re.M)
 SHRUNK_LINE = re.compile(r"is larger than new printable size")
 NEW_CENTER_LINE = re.compile(r"new_center: \{\s*(-?[\d.]+),\s*(-?[\d.]+)\s*\}")
@@ -89,6 +91,12 @@ TOWER_ESTIMATE_LINE = re.compile(
 TOWER_ORIGIN_LINE = re.compile(r"wipe_x\s+(-?[\d.]+),\s*wipe_y\s+(-?[\d.]+)")
 # The engine names the tower this way in its conflict line.
 TOWER_PARTY = "WipeTower"
+
+# And it refuses a plate — exit status 156, `-100`, "Failed slicing the model" —
+# when an object has islands that start in mid-air and the file has supports
+# off for it. The name of the object is in the engine's log only.
+SLICE_FAILED = -100
+FLOATING_LINE = re.compile(r"It seems object (.+?) has floating regions")
 
 
 @dataclasses.dataclass
@@ -165,6 +173,8 @@ class OrcaSlicerEngine(SlicerEngine):
         workdir: str,
         project_overrides: dict | None = None,
         object_extruders: dict | None = None,
+        object_settings: dict | None = None,
+        heads: int | None = None,
     ) -> str:
         """Bambu project files need repairing before Orca will load them. Files
         that are already clean pass through untouched."""
@@ -177,7 +187,7 @@ class OrcaSlicerEngine(SlicerEngine):
                 return input_path
 
         repaired = os.path.join(workdir, "repaired.3mf")
-        repair(input_path, repaired, project_overrides, object_extruders)
+        repair(input_path, repaired, project_overrides, object_extruders, object_settings, heads)
         return repaired
 
     def slice(self, request: SliceRequest, workdir: str) -> SliceResult:
@@ -204,15 +214,20 @@ class OrcaSlicerEngine(SlicerEngine):
         if not self.is_available():
             raise EngineUnavailable(f"{self.code}: binary missing at {self.binary}")
 
-        rewrites, palette = self._extruder_remap(
-            request.input_path, self._head_count(request.machine_profile)
-        )
+        heads = self._head_count(request.machine_profile)
+        rewrites, palette = self._extruder_remap(request.input_path, heads)
         facts = self._palette_facts(request.input_path) if palette else {}
         source = self.preprocess(
             request.input_path,
             workdir,
             self._machine_overrides(request.machine_profile),
             rewrites,
+            # `--brim-type=no_brim` is a default the file's objects can
+            # override for themselves, and some do — see _run_slice.
+            {} if request.brim else {"brim_type": "no_brim"},
+            # Only a profile says how many heads there are; without one the
+            # file's own assignment stands — see point 4 in repair3mf.
+            heads if request.machine_profile else None,
         )
 
         declared = self._plate_count(source)
@@ -345,7 +360,7 @@ class OrcaSlicerEngine(SlicerEngine):
 
     # Each named remedy is one thing worth changing about a refused plate,
     # tried at most once and in this order.
-    REMEDIES = ("conflict", "tower", "labels")
+    REMEDIES = ("conflict", "tower", "labels", "supports", "raft")
 
     # How many times a plate refused for no nameable reason is simply run
     # again, unchanged. See _remedy() for why this number and not a smaller one.
@@ -412,6 +427,38 @@ class OrcaSlicerEngine(SlicerEngine):
                     note="object labels switched off, which the file's own ids broke",
                 )
 
+        if code == SLICE_FAILED:
+            # **An object that starts in mid-air.** The engine checks whether
+            # anything on the plate has islands with nothing beneath them and,
+            # with supports off, gives up on the whole plate; Bambu Studio only
+            # warns. In practice it is small rotated parts — eyes of
+            # 8×11×5 mm — and the author's file has supports off for them.
+            #
+            # The answer is the one the printer would need anyway: supports on
+            # this plate, and when the floating island sits in the first layers,
+            # where there is nothing to stand a support on, a raft under it
+            # (the pig's plate 3: supports alone still refuse, two raft layers
+            # slice). Both add grams, and both are what the print would really
+            # cost, so they are reported rather than done quietly; the support
+            # grams show up in `supports` as on any other plate. Per plate, not
+            # sticky: the plates next to it print without either.
+            if "supports" not in tried:
+                floating = FLOATING_LINE.findall(self._engine_log(workdir))
+                if floating:
+                    names = ", ".join(f'"{n}"' for n in dict.fromkeys(floating))
+                    return _Remedy(
+                        kind="supports",
+                        argv=["--enable-support=1"],
+                        note=f"supports switched on: {names} would start in mid-air",
+                    )
+            elif "raft" not in tried:
+                return _Remedy(
+                    kind="raft",
+                    argv=["--raft-layers=2"],
+                    note="a two-layer raft added: supports alone left a floating "
+                    "part with nothing to stand on",
+                )
+
         # Last, and only once nothing above has a name for what went wrong:
         # run the very same command again.
         #
@@ -461,7 +508,7 @@ class OrcaSlicerEngine(SlicerEngine):
             "--export-3mf", output_name,
             # Neither stream ever says what `-101` found crossing, or that the
             # plate was moved to fit our bed; the log file does, in a few
-            # hundred lines, and both streams stay exactly as they were.
+            # thousand lines, and both streams stay exactly as they were.
             "--debug", ENGINE_LOG_LEVEL,
             "--logfile", os.path.join(workdir, ENGINE_LOG),
         ]
