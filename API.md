@@ -300,7 +300,8 @@ tree from 0.2 to 27 mm, 0.93 g, and the count does not move between cells of
 0.5 and 4 mm.
 
 **`plates[].adjustments`** lists what had to be changed before that plate would
-slice at all — moving a purge tower back onto the bed, or into a free corner
+slice at all — moving a plate the file lays out past the bed's edge back
+onto it (1.13.2), moving a purge tower back onto the bed, or into a free corner
 of it when the engine found it across a part, or switching supports on (and,
 if that is not enough, a raft) for a plate the engine refused because an object
 would start in mid-air, or normal supports in place of tree ones the engine
@@ -650,6 +651,12 @@ and is reported in every response.
   Every response and every refusal now carries `journal` and `engine_logs`.
   **Use 1.13.1**: the 1.13.0 image was published without `paint.py` and does
   not start.
+- **1.13.2** puts back on the bed a plate the file lays out past its edge —
+  the whole plate, by the least distance, with its tower — when the plate as a
+  whole fits; `plates[].adjustments` says by how much. A plate that does not
+  fit is refused with `off_bed` at once, where `-52` (some object only partly
+  on the bed) used to be retried six times and refused with no name. No field
+  changed shape; only plates that used to be refused are affected.
 
 Fields are added, not repurposed. The one thing a caller must handle is the
 difference between a field being **absent** — an older service that has never

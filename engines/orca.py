@@ -69,6 +69,15 @@ GCODE_OUTSIDE_BED = -102
 # point — the file can, and `_plate_has_objects()` asks it.
 PLATE_NOT_INSIDE = -50
 
+# And — as exit status 204 — when some object is only partly on the bed: the
+# file's own layout puts a part over the edge. The same family as the two above,
+# found before slicing; see _plate_onto_bed().
+OBJECTS_PARTLY_INSIDE = -52
+
+# Orca lays the plates of a file out in a grid on one canvas, a fifth of a bed
+# apart; a plate's bed in the file's coordinates follows from its index.
+PLATE_GAP = 0.2
+
 # And it refuses a sliced plate — exit status 155 — when two toolpaths cross:
 # its own check after slicing found the G-code of one thing inside another. The
 # file's objects do not collide with each other in a file anyone has printed
@@ -114,6 +123,9 @@ class _Remedy:
     kind: str
     argv: list[str]
     note: str
+    # A rewritten copy of the file to slice from now on, for the one remedy
+    # that cannot be said on the command line (_plate_onto_bed).
+    source: str | None = None
     # True when the finding is about the file rather than about one plate, so
     # the rest of the plates can start with it instead of each paying for the
     # same refused run.
@@ -414,6 +426,8 @@ class OrcaSlicerEngine(SlicerEngine):
             if not remedy:
                 break
             extra = self._with_flags(extra, remedy.argv)
+            if remedy.source:
+                source = remedy.source
             tried.append(remedy.kind)
             self._note(plate, "remedy", remedy.kind + (f": {remedy.note}" if remedy.note else ""),
                        flags=list(remedy.argv))
@@ -688,7 +702,7 @@ class OrcaSlicerEngine(SlicerEngine):
 
     # Each named remedy is one thing worth changing about a refused plate,
     # tried at most once and in this order.
-    REMEDIES = ("conflict", "tower", "labels", "supports", "raft", "normal_supports")
+    REMEDIES = ("conflict", "tower", "bed", "labels", "supports", "raft", "normal_supports")
 
     # How many times a plate refused for no nameable reason is simply run
     # again, unchanged. See _remedy() for why this number and not a smaller one.
@@ -732,11 +746,17 @@ class OrcaSlicerEngine(SlicerEngine):
                     return moved
             raise self._off_bed(request, source, workdir, plate, proc)
 
-        if code == PLATE_NOT_INSIDE and self._plate_has_objects(source, plate):
+        if code in (PLATE_NOT_INSIDE, OBJECTS_PARTLY_INSIDE) and self._plate_has_objects(source, plate):
             # The same verdict one step earlier, and only when the file says this
             # plate carries objects — otherwise the binary's other reading of
-            # this code is the right one, the plate is simply empty, and that is
-            # not something to answer with a sentence about the bed.
+            # `-50` is the right one, the plate is simply empty, and that is not
+            # something to answer with a sentence about the bed. A plate whose
+            # parts all fit, but which the file lays out past the edge, is put
+            # back on the bed once, whole (1.13.2); anything else is final.
+            if "bed" not in tried:
+                moved = self._plate_onto_bed(request, source, workdir, plate)
+                if moved:
+                    return moved
             raise self._off_bed(request, source, workdir, plate, proc)
 
         if "labels" not in tried:
@@ -2494,6 +2514,101 @@ class OrcaSlicerEngine(SlicerEngine):
             log=self._log(proc),
             reason=SliceFailed.OFF_BED,
         )
+
+    def _plate_onto_bed(
+        self, request: SliceRequest, source: str, workdir: str, plate: int
+    ) -> "_Remedy | None":
+        """Move a plate the file lays out past the bed's edge back onto it — the
+        whole plate, by the least that puts every part on the bed.
+
+        The turtle's plate 5 has a 26 mm part 23 mm past the front edge of its
+        author's bed, while the plate as a whole spans 157 × 237 mm and our bed
+        is 270 × 270 (1.13.2). Moving the plate rather than the part is the
+        owner's choice (2026-10-15): the parts keep their places relative to
+        each other and to the tower, so nothing comes any closer to anything
+        and no free spot has to be guessed — the bed is put back under the
+        print. A plate wider than the bed cannot be, and is refused.
+
+        **Where the bed is, in the file's coordinates.** Orca places the plates
+        of a file in a grid a fifth of a bed apart, `ceil(√n)` to a row, and on
+        loading moves each plate from the author's bed onto ours centre to
+        centre. So the room a plate has, in the file's frame, is our bed's size
+        centred on the author's bed — measured against the parts' boxes as
+        layout.py places them.
+        """
+        ours = self._bed_box(request.machine_profile)
+        theirs = self._file_bed(source)
+        plates, _ = self._layout(source)
+        ids = plates.get(plate or 1) or []
+        if not ours or not theirs or not ids or not plates:
+            return None
+
+        found = layout.plate_models(source, {plate or 1: [int(o) for o in ids]}).get(plate or 1)
+        models = found.models if found else []
+        if not models or any(not m.lo for m in models):
+            return None
+        lo = [min(m.lo[i] for m in models) for i in (0, 1)]
+        hi = [max(m.hi[i] for m in models) for i in (0, 1)]
+
+        count = max(plates)
+        root = math.sqrt(count)
+        cols = int(round(root)) + (1 if root > round(root) else 0)
+        index = (plate or 1) - 1
+        width, depth = theirs[1] - theirs[0], theirs[3] - theirs[2]
+        origin = ((index % cols) * width * (1 + PLATE_GAP), -(index // cols) * depth * (1 + PLATE_GAP))
+        centre = (origin[0] + (theirs[0] + theirs[1]) / 2, origin[1] + (theirs[2] + theirs[3]) / 2)
+        room = (ours[1] - ours[0], ours[3] - ours[2])
+
+        shift = []
+        for axis in (0, 1):
+            low, high = centre[axis] - room[axis] / 2, centre[axis] + room[axis] / 2
+            span = hi[axis] - lo[axis]
+            if span > room[axis]:
+                return None
+            margin = min(1.0, (room[axis] - span) / 2)
+            if lo[axis] < low + margin:
+                shift.append(low + margin - lo[axis])
+            elif hi[axis] > high - margin:
+                shift.append(high - margin - hi[axis])
+            else:
+                shift.append(0.0)
+        if not any(shift):
+            return None
+
+        from repair3mf import shift_plate
+
+        moved = os.path.join(workdir, "on-bed.3mf")
+        shift_plate(source, moved, ids, plate or 1, shift[0], shift[1])
+        said = " and ".join(
+            f"{axis} by {round(d, 1)} mm" for axis, d in zip("xy", shift) if d
+        )
+        return _Remedy(
+            kind="bed",
+            argv=[],
+            note=f"plate moved {said}: the file lays it out past the edge of the bed, "
+            f"and the whole plate ({round(hi[0] - lo[0], 1)} × {round(hi[1] - lo[1], 1)} mm) fits",
+            source=moved,
+        )
+
+    def _file_bed(self, source: str) -> tuple[float, ...] | None:
+        """The author's bed as (x0, x1, y0, y1), from the file's printable_area."""
+        try:
+            with zipfile.ZipFile(source) as zf:
+                area = json.loads(zf.read(PROJECT_SETTINGS)).get("printable_area")
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+            return None
+        points = []
+        for corner in area or []:
+            try:
+                x, y = str(corner).split("x")
+                points.append((float(x), float(y)))
+            except ValueError:
+                return None
+        if not points:
+            return None
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        return min(xs), max(xs), min(ys), max(ys)
 
     def _plate_has_objects(self, source: str, plate: int) -> bool:
         """Does the file put anything on this plate?

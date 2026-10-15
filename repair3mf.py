@@ -323,6 +323,53 @@ def drop_objects(src: str, dst: str, object_ids: list[str]) -> None:
             zout.writestr(item, data)
 
 
+ITEM_TRANSFORM = re.compile(r'(<item\s[^>]*objectid="(\d+)"[^>]*\btransform=")([^"]+)(")')
+
+
+def shift_plate(src: str, dst: str, object_ids: list[str], plate: int, dx: float, dy: float) -> None:
+    """A copy of `src` with one plate's objects — and its prime tower — moved by
+    (dx, dy) millimetres on the bed.
+
+    The whole plate moves as one, so nothing on it comes any closer to anything
+    else: it is the bed that is put back under the print, not the print that
+    is rearranged (see OrcaSlicerEngine._plate_onto_bed). Objects move by the
+    translation of their build item; the tower's place is stored per plate,
+    relative to the plate, so it moves by the same amount.
+    """
+    wanted = set(object_ids)
+
+    def moved(match: re.Match) -> str:
+        if match.group(2) not in wanted:
+            return match.group(0)
+        values = match.group(3).split()
+        if len(values) != 12:
+            return match.group(0)
+        values[9] = _num(float(values[9]) + dx)
+        values[10] = _num(float(values[10]) + dy)
+        return match.group(1) + " ".join(values) + match.group(4)
+
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "3D/3dmodel.model":
+                data = ITEM_TRANSFORM.sub(moved, data.decode("utf-8")).encode("utf-8")
+            elif item.filename == PROJECT_CONFIG:
+                project = json.loads(data)
+                for key, delta in (("wipe_tower_x", dx), ("wipe_tower_y", dy)):
+                    values = project.get(key)
+                    if isinstance(values, list) and 0 < plate <= len(values):
+                        try:
+                            values[plate - 1] = _num(float(values[plate - 1]) + delta)
+                        except (TypeError, ValueError):
+                            pass
+                data = json.dumps(project, indent=4).encode("utf-8")
+            zout.writestr(item, data)
+
+
+def _num(value: float) -> str:
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
 if __name__ == "__main__":
     import sys
 
