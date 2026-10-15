@@ -657,6 +657,14 @@ and is reported in every response.
   fit is refused with `off_bed` at once, where `-52` (some object only partly
   on the bed) used to be retried six times and refused with no name. No field
   changed shape; only plates that used to be refused are affected.
+- **1.13.3** slices an object of a single part in that part's colour, as the
+  slicer the file was made in shows it; the engine used the object's colour
+  instead, so a plate could come back in one colour where the author put
+  several. This **moves colours, not weights**: `filaments[]` and
+  `plates[].filaments` of eight reference files name different slots, and
+  some name more of them. A plate's colours are now those of the parts that
+  print — not of negative parts or modifiers — which stops 1.13 from refusing
+  a one-colour plate as a mixed-height tower plate.
 
 Fields are added, not repurposed. The one thing a caller must handle is the
 difference between a field being **absent** — an older service that has never

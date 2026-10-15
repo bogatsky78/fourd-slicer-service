@@ -1885,11 +1885,34 @@ class OrcaSlicerEngine(SlicerEngine):
 
         objects: dict[str, set[int]] = {}
         for obj in root.findall("object"):
-            used = set()
-            for node in [obj, *obj.findall("part")]:
+            # What prints is a part's colour — its own, or the object's when it
+            # states none. A negative part cuts and a modifier changes settings;
+            # neither prints, and counting their numbers made the fried chicken's
+            # beak a four-colour plate that needed a tower (1.13.3). One part
+            # alone prints in its own colour once repair3mf has made the object
+            # say so (_single_part_colour).
+            def own(node):
                 for meta in node.findall("metadata"):
-                    if meta.get("key") == "extruder" and (meta.get("value") or "").isdigit():
-                        used.add(int(meta.get("value")))
+                    value = meta.get("value") or ""
+                    if meta.get("key") == "extruder" and value.isdigit() and value != "0":
+                        return int(value)
+                return None
+
+            parts = obj.findall("part")
+            printing = [p for p in parts if p.get("subtype", "normal_part") == "normal_part"]
+            base = own(obj)
+            used = set()
+            if len(parts) == 1 and printing and own(printing[0]) is not None:
+                used.add(own(printing[0]))
+            else:
+                for part in printing:
+                    colour = own(part)
+                    if colour is not None:
+                        used.add(colour)
+                    elif base is not None:
+                        used.add(base)
+                if not printing and base is not None:
+                    used.add(base)
             objects[obj.get("id")] = used
 
         plates: dict[int, list[str]] = {}

@@ -172,6 +172,39 @@ def _apply_overrides(cfg: dict, overrides: dict) -> list[str]:
     return changed
 
 
+SETTINGS_OBJECT = re.compile(r'<object\s+id="\d+">.*?</object>', re.S)
+PART_OPEN = re.compile(r'<part\s[^>]*>')
+
+
+def _single_part_colour(settings: str) -> str:
+    """An object of one part prints in its part's colour, as Bambu Studio has it.
+
+    A Bambu project states an extruder twice — on the object and on each part —
+    and when the object has a single part the engine reads the object's and
+    drops the part's. The author set the part: the zen eagle's body is part
+    extruder 4 (brown) under an object left on 1 (black), and it sliced black,
+    one colour for a plate that has two and a slot the product never got
+    (1.13.3; the same in 1.10). So the object takes its part's number, which
+    is what the author sees in the slicer the file was made in. Line-based, for
+    the reason _rewrite_extruders() gives.
+    """
+
+    def one(match: re.Match) -> str:
+        block = match.group(0)
+        parts = PART_OPEN.findall(block)
+        if len(parts) != 1 or 'subtype="normal_part"' not in parts[0]:
+            return block
+        head, _, tail = block.partition(parts[0])
+        found = EXTRUDER_VALUE.search(tail)
+        if not found or found.group(2) == "0":
+            return block
+        return EXTRUDER_VALUE.sub(
+            lambda m: f"{m.group(1)}{found.group(2)}{m.group(3)}", head, count=1
+        ) + parts[0] + tail
+
+    return SETTINGS_OBJECT.sub(one, settings)
+
+
 def _rewrite_object_settings(settings: str, values: dict) -> str:
     """Overwrite `values` wherever the file states them; see point 5 above.
 
@@ -187,7 +220,7 @@ def _rewrite_object_settings(settings: str, values: dict) -> str:
     return settings
 
 
-def _rewrite_extruders(settings: str, per_object: dict) -> str:
+def _rewrite_extruders(settings: str, per_object: dict, heads: int | None = None) -> str:
     """Renumber the extruder each object's parts print with.
 
     Line-based rather than through an XML parser, and deliberately so: this file
@@ -215,6 +248,14 @@ def _rewrite_extruders(settings: str, per_object: dict) -> str:
             if found and found.group(2) in mapping:
                 line = EXTRUDER_VALUE.sub(
                     lambda m: f"{m.group(1)}{mapping[m.group(2)]}{m.group(3)}", line
+                )
+            elif found and heads and int(found.group(2)) > heads:
+                # A number nothing on this object prints with — the object's
+                # own under parts that all state theirs, or a negative part's —
+                # still has to name a head the machine has, or the engine dies
+                # on it as on any other (1.2). Where it lands does not matter.
+                line = EXTRUDER_VALUE.sub(
+                    lambda m: f"{m.group(1)}{min(mapping.values(), key=int)}{m.group(3)}", line
                 )
         out.append(line)
     return "".join(out)
@@ -262,8 +303,9 @@ def repair(
                 continue  # rewritten below
             if name == MODEL_CONFIG:
                 settings = _fix_plate_map_mode(zin.read(name).decode("utf-8"), heads)
+                settings = _single_part_colour(settings)
                 settings = _rewrite_object_settings(settings, object_settings or {})
-                zout.writestr(item, _rewrite_extruders(settings, object_extruders or {}))
+                zout.writestr(item, _rewrite_extruders(settings, object_extruders or {}, heads))
                 continue
             if mesh_paint and name in mesh_paint:
                 zout.writestr(item, paint.rewrite_mesh_file(zin.read(name), mesh_paint[name]))
