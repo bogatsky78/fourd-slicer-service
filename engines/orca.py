@@ -6,7 +6,9 @@ the Snapmaker U1 profiles too, so nothing is lost.
 """
 from __future__ import annotations
 
+import base64
 import dataclasses
+import gzip
 import itertools
 import json
 import math
@@ -14,10 +16,13 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 import xml.etree.ElementTree as ET
 import zipfile
 
 import layout
+import paint
 import supports
 
 from .base import (
@@ -131,6 +136,8 @@ class OrcaSlicerEngine(SlicerEngine):
         self.profiles_dir = profiles_dir
         self.timeout = timeout
         self._version: str | None = None
+        # The journal of the slice running on this thread; see slice().
+        self._local = threading.local()
 
     # -- discovery ---------------------------------------------------------
 
@@ -178,6 +185,7 @@ class OrcaSlicerEngine(SlicerEngine):
         object_extruders: dict | None = None,
         object_settings: dict | None = None,
         heads: int | None = None,
+        mesh_paint: dict | None = None,
     ) -> str:
         """Bambu project files need repairing before Orca will load them. Files
         that are already clean pass through untouched."""
@@ -190,10 +198,77 @@ class OrcaSlicerEngine(SlicerEngine):
                 return input_path
 
         repaired = os.path.join(workdir, "repaired.3mf")
-        repair(input_path, repaired, project_overrides, object_extruders, object_settings, heads)
+        repair(
+            input_path, repaired, project_overrides, object_extruders, object_settings, heads, mesh_paint
+        )
         return repaired
 
     def slice(self, request: SliceRequest, workdir: str) -> SliceResult:
+        """Slice the file, and say how: a journal of the steps and every engine
+        run's full log, on the answer and on the refusal alike.
+
+        **Why it is carried out rather than kept.** Until 1.13 a refused plate
+        left a sentence and nothing else: the work directory with the engine's
+        log is deleted at the end of every request, and finding out why the
+        capybara's plate 5 failed took slicing it again by hand in the
+        container — where it turned out to be this service's own doing (paint,
+        see paint.py). The caller stores what it is given, so the
+        service itself keeps nothing and its RAM disk stays empty.
+
+        `journal` is a list of short entries — `{plate, pass, step, text, ...}`,
+        steps `prepare`, `split`, `run`, `remedy` — in the order they happened.
+        `engine_logs` holds one entry per run of the binary: `name`, `plate`,
+        `pass`, `run`, and `gzip_base64` of the command line, both streams and
+        the engine's own log file.
+        """
+        self._local.journal = []
+        self._local.logs = []
+        self._local.pass_no = None
+        try:
+            result = self._slice_file(request, workdir)
+        except SliceFailed as exc:
+            exc.journal, exc.engine_logs = self._local.journal, self._local.logs
+            raise
+        finally:
+            journal, logs = self._local.journal, self._local.logs
+            self._local.journal = self._local.logs = None
+        result.journal, result.engine_logs = journal, logs
+        return result
+
+    def _note(self, plate: int | None, step: str, text: str, **extra) -> None:
+        journal = getattr(self._local, "journal", None)
+        if journal is None:
+            return
+        journal.append({
+            "plate": plate,
+            "pass": getattr(self._local, "pass_no", None),
+            "step": step,
+            "text": text,
+            **extra,
+        })
+
+    def _keep_log(self, plate: int, argv: list[str], proc, workdir: str) -> str | None:
+        logs = getattr(self._local, "logs", None)
+        if logs is None:
+            return None
+        pass_no = getattr(self._local, "pass_no", None)
+        run = 1 + sum(1 for e in logs if e["plate"] == plate and e["pass"] == pass_no)
+        name = f"plate-{plate}" + (f"-pass-{pass_no}" if pass_no else "") + f"-run-{run}.log"
+        text = (
+            f"argv: {' '.join(argv)}\nexit: {proc.returncode}\n\n"
+            f"== stdout ==\n{proc.stdout or ''}\n== stderr ==\n{proc.stderr or ''}\n"
+            f"== engine log ==\n{self._engine_log(workdir)}"
+        )
+        logs.append({
+            "name": name,
+            "plate": plate,
+            "pass": pass_no,
+            "run": run,
+            "gzip_base64": base64.b64encode(gzip.compress(text.encode("utf-8"), 6)).decode("ascii"),
+        })
+        return name
+
+    def _slice_file(self, request: SliceRequest, workdir: str) -> SliceResult:
         """Slice the file, one plate per run of the binary.
 
         **Why not hand the binary the whole file and let it walk the plates.**
@@ -218,7 +293,7 @@ class OrcaSlicerEngine(SlicerEngine):
             raise EngineUnavailable(f"{self.code}: binary missing at {self.binary}")
 
         heads = self._head_count(request.machine_profile)
-        rewrites, palette = self._extruder_remap(request.input_path, heads)
+        rewrites, palette, painted = self._extruder_remap(request.input_path, heads)
         facts = self._palette_facts(request.input_path) if palette else {}
         source = self.preprocess(
             request.input_path,
@@ -231,7 +306,15 @@ class OrcaSlicerEngine(SlicerEngine):
             # Only a profile says how many heads there are; without one the
             # file's own assignment stands — see point 4 in repair3mf.
             heads if request.machine_profile else None,
+            painted,
         )
+        for n, mapping in sorted(palette.items()):
+            self._note(n, "prepare", "filaments renumbered onto the heads: " + ", ".join(
+                f"{old} → {new}" for new, old in sorted(mapping.items())))
+        if painted:
+            self._note(None, "prepare", f"paint changed in {sum(len(v) for v in painted.values())} "
+                       f"mesh(es): renumbered with the base, or dropped from parts painted all "
+                       f"over in one colour (those take that colour)")
 
         declared = self._plate_count(source)
         if request.plates:
@@ -249,15 +332,27 @@ class OrcaSlicerEngine(SlicerEngine):
         sliced = []
         learned: list[str] = []
         for n in wanted:
-            usage, log = self._slice_plate(
-                request,
-                source,
-                os.path.join(workdir, f"plate-{n}"),
-                n,
-                palette.get(n, {}),
-                facts,
-                learned,
-            )
+            try:
+                groups = self._split_plan(source, n)
+            except SliceFailed as exc:
+                self._note(n, "split", str(exc), reason=exc.reason)
+                raise
+            if groups:
+                self._note(n, "split", f"printed in {len(groups)} passes, one per layer height: "
+                           + " | ".join(", ".join(g) for g in groups) + " (object ids)")
+                usage, log = self._slice_in_passes(
+                    request, source, workdir, n, groups, palette.get(n, {}), facts, learned
+                )
+            else:
+                usage, log = self._slice_plate(
+                    request,
+                    source,
+                    os.path.join(workdir, f"plate-{n}"),
+                    n,
+                    palette.get(n, {}),
+                    facts,
+                    learned,
+                )
             sliced.append((usage, log))
 
         result = self._merge([p for p, _ in sliced], plate_count=max(declared, len(sliced)))
@@ -273,10 +368,7 @@ class OrcaSlicerEngine(SlicerEngine):
         # A plate's kind as the slice found it, which beats the file's slot
         # assignments: the hydra's file puts two colours on a plate the engine
         # loads one filament for, and a prime tower is built for what is loaded.
-        sliced_kind = {
-            p.index: ("ams" if len([f for f in p.filaments if f.used_g > 0]) > 1 else "simple")
-            for p in result.plates
-        }
+        sliced_kind = {p.index: ("ams" if p.colours > 1 else "simple") for p in result.plates}
         for plate in result.model.plates:
             if plate.index in sliced_kind:
                 plate.kind = sliced_kind[plate.index]
@@ -323,6 +415,8 @@ class OrcaSlicerEngine(SlicerEngine):
                 break
             extra = self._with_flags(extra, remedy.argv)
             tried.append(remedy.kind)
+            self._note(plate, "remedy", remedy.kind + (f": {remedy.note}" if remedy.note else ""),
+                       flags=list(remedy.argv))
             # A plain retry says nothing on its own; what is worth reporting is
             # how many of them it took, and that is only known once one worked.
             if remedy.note:
@@ -362,6 +456,235 @@ class OrcaSlicerEngine(SlicerEngine):
         # for.
         shutil.rmtree(workdir, ignore_errors=True)
         return usage, self._log(proc)
+
+    # -- a plate printed in passes ----------------------------------------
+
+    def _split_plan(self, source: str, plate: int) -> list[list[str]] | None:
+        """How to print a plate the engine would refuse over layer heights.
+
+        **The rule is the engine's, and narrower than it reads.** Orca — and
+        Bambu Studio, which has the same check — refuses a plate whose parts
+        have different layer heights only when it builds a prime tower for it,
+        that is when the plate loads more than one filament. A one-colour plate
+        with parts at 0.16, 0.12 and 0.08 slices without complaint; a plate with
+        a 0.24 turtle in one colour and three 0.08 trinkets in another does not.
+        The check runs before any slicing, so the refusal itself costs seconds —
+        but every plate of the file sliced before it is paid for, and nothing
+        the retries do can change the answer.
+
+        **What we do instead is print it in passes**, one per layer height: the
+        same plate run once with only the 0.24 parts and once with only the
+        0.08 ones. Each pass is either one colour (no tower) or one height (a
+        tower it is allowed), and every part keeps its position and the height
+        its author gave it. Levelling the heights instead was ruled out by the
+        owner (2026-10-15): a thicker layer makes a small part bigger, not just
+        coarser.
+
+        **Passes split between models, never inside one** — models as layout.py
+        finds them. A plate is refused rather than split (owner, 2026-10-15)
+        when it holds a flexi model; when one model's own parts differ in
+        height; or when models of different heights have overlapping boxes,
+        which is the guard against a joint layout.py did not recognise.
+
+        Returns the object ids of each pass, None when the plate prints as it
+        is, and raises the refusal.
+        """
+        plates, objects = self._layout(source)
+        on_plate = plates.get(plate) or []
+        if len(on_plate) < 2:
+            return None
+        if len({e for oid in on_plate for e in objects.get(oid, set())}) < 2:
+            return None  # one filament: no tower, any heights
+
+        heights, custom = self._object_heights(source, on_plate)
+        if custom or not self._tower_enabled(source):
+            return None
+        if len({heights[oid] for oid in on_plate}) < 2:
+            return None
+
+        def named(oid: str) -> str:
+            return f"{self._object_names(source).get(oid, 'object ' + oid)} {heights[oid][0]:g} mm"
+
+        found = layout.plate_models(source, {plate: [int(o) for o in on_plate]}).get(plate)
+        models = found.models if found else []
+        if not models:
+            raise SliceFailed(
+                f"{self.code}: plate {plate} needs a prime tower and its parts have "
+                f"different layer heights, and its models could not be read to print it "
+                f"in passes: " + ", ".join(named(o) for o in on_plate),
+                reason=SliceFailed.LAYER_HEIGHTS,
+            )
+
+        flexi = [m for m in models if m.kind == "flexi"]
+        if flexi:
+            parts = ", ".join(named(str(o)) for m in flexi for o in m.object_ids)
+            raise SliceFailed(
+                f"{self.code}: plate {plate} needs a prime tower and its parts have "
+                f"different layer heights; it holds a flexi model ({parts}), so it is "
+                f"not printed in passes. Give every part of the plate one layer height, "
+                f"or put the parts of each height on a plate of their own.",
+                reason=SliceFailed.LAYER_HEIGHTS,
+            )
+        for model in models:
+            own = {heights.get(str(o)) for o in model.object_ids}
+            if len(own) > 1:
+                raise SliceFailed(
+                    f"{self.code}: plate {plate} needs a prime tower and its parts have "
+                    f"different layer heights, and one model is made of parts of different "
+                    f"heights: " + ", ".join(named(str(o)) for o in model.object_ids)
+                    + ". Give that model one layer height.",
+                    reason=SliceFailed.LAYER_HEIGHTS,
+                )
+
+        by_height: dict[tuple, list] = {}
+        for model in models:
+            by_height.setdefault(heights[str(model.object_ids[0])], []).append(model)
+        for a, b in itertools.combinations(by_height, 2):
+            for ma in by_height[a]:
+                for mb in by_height[b]:
+                    if self._boxes_meet(ma, mb):
+                        raise SliceFailed(
+                            f"{self.code}: plate {plate} needs a prime tower and its parts "
+                            f"have different layer heights, and parts of different heights "
+                            f"reach into each other ("
+                            + ", ".join(named(str(o)) for o in ma.object_ids + mb.object_ids)
+                            + "), so it is not printed in passes.",
+                            reason=SliceFailed.LAYER_HEIGHTS,
+                        )
+
+        # Objects with no mesh of their own (none on a real plate) would fall
+        # out of every pass; they ride with the first.
+        groups = [
+            sorted({str(o) for m in group for o in m.object_ids}, key=int)
+            for _, group in sorted(by_height.items(), reverse=True)
+        ]
+        placed = {o for g in groups for o in g}
+        groups[0] += [o for o in on_plate if o not in placed]
+        return groups
+
+    @staticmethod
+    def _boxes_meet(a, b) -> bool:
+        """Boxes that overlap at all — the conservative reading: two models
+        placed side by side never do, and anything closer is not split."""
+        if not a.lo or not b.lo:
+            return True
+        return all(min(a.hi[i], b.hi[i]) > max(a.lo[i], b.lo[i]) for i in range(3))
+
+    def _object_heights(self, source: str, object_ids: list[str]) -> tuple[dict[str, tuple], bool]:
+        """Layer height and first-layer height per object — what the engine
+        compares — and whether any of them has a variable-height profile, which
+        is the engine's own business and left to it."""
+        root = self._model_settings(source)
+        try:
+            with zipfile.ZipFile(source) as zf:
+                project = json.loads(zf.read(PROJECT_SETTINGS))
+                names = set(zf.namelist())
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+            return {}, True
+        if any("layer_heights_profile" in n for n in names):
+            return {}, True
+
+        default = (self._maybe_float(project.get("layer_height")),
+                   self._maybe_float(project.get("initial_layer_print_height")))
+        wanted = set(object_ids)
+        heights: dict[str, tuple] = {oid: default for oid in object_ids}
+        custom = False
+        for obj in (root.findall("object") if root is not None else []):
+            oid = obj.get("id")
+            if oid not in wanted:
+                continue
+            meta = {m.get("key"): m.get("value") for m in obj.findall("metadata")}
+            heights[oid] = (
+                self._maybe_float(meta.get("layer_height")) or default[0],
+                self._maybe_float(meta.get("initial_layer_print_height")) or default[1],
+            )
+            custom = custom or obj.find("layer_config_ranges") is not None
+        return heights, custom
+
+    def _tower_enabled(self, source: str) -> bool:
+        try:
+            with zipfile.ZipFile(source) as zf:
+                project = json.loads(zf.read(PROJECT_SETTINGS))
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+            return False
+        return str(project.get("enable_prime_tower", "0")).strip().lower() in ("1", "true")
+
+    def _object_names(self, source: str) -> dict[str, str]:
+        root = self._model_settings(source)
+        names = {}
+        for obj in (root.findall("object") if root is not None else []):
+            for meta in obj.findall("metadata"):
+                if meta.get("key") == "name" and meta.get("value"):
+                    names[obj.get("id")] = meta.get("value")
+                    break
+        return names
+
+    def _slice_in_passes(
+        self,
+        request: SliceRequest,
+        source: str,
+        workdir: str,
+        plate: int,
+        groups: list[list[str]],
+        palette: dict[int, int],
+        facts: dict[int, dict],
+        learned: list[str],
+    ) -> tuple[PlateUsage, str]:
+        """Slice each pass from a copy of the file holding only its objects,
+        and report the plate as their sum with the passes underneath.
+
+        Removing an object means all of it — its resource, its build item, its
+        settings, its plate entry, its assembly entry: with only the build item
+        gone the engine refuses the file as unparseable (-6).
+        """
+        from repair3mf import drop_objects
+
+        on_plate = [o for g in groups for o in g]
+        heights, _ = self._object_heights(source, on_plate)
+        passes: list[PlateUsage] = []
+        log = ""
+        for k, group in enumerate(groups, start=1):
+            self._local.pass_no = k
+            pass_dir = os.path.join(workdir, f"plate-{plate}-pass-{k}")
+            os.makedirs(pass_dir, exist_ok=True)
+            variant = os.path.join(pass_dir, "pass.3mf")
+            drop_objects(source, variant, [o for o in on_plate if o not in group])
+            usage, log = self._slice_plate(
+                request, variant, os.path.join(pass_dir, "run"), plate, palette, facts, learned
+            )
+            os.remove(variant)
+            passes.append(usage)
+        self._local.pass_no = None
+
+        names = self._object_names(source)
+        described = "; ".join(
+            f"{heights[g[0]][0]:g} mm — " + ", ".join(names.get(o, "object " + o) for o in g)
+            for g in groups
+        )
+        usage = self._sum_passes(plate, passes)
+        usage.adjustments = [
+            f"printed in {len(passes)} passes, one per layer height, because a plate "
+            f"with a prime tower must have one: {described}"
+        ] + [f"pass {k}: {note}" for k, p in enumerate(passes, start=1) for note in p.adjustments]
+        return usage, log
+
+    def _sum_passes(self, plate: int, passes: list[PlateUsage]) -> PlateUsage:
+        times = [p.print_time_sec for p in passes]
+        changes = [p.filament_changes for p in passes]
+        found = [p.supports for p in passes]
+        warnings: list[str] = []
+        for p in passes:
+            warnings += [w for w in p.warnings if w not in warnings]
+        return PlateUsage(
+            index=plate,
+            weight_g=round(sum(p.weight_g for p in passes), 2),
+            print_time_sec=None if None in times else sum(times),
+            filaments=self._merge_slots([f for p in passes for f in p.filaments]),
+            filament_changes=None if None in changes else sum(changes),
+            supports=None if None in found else sorted((g for s in found for g in s), reverse=True),
+            warnings=warnings,
+            passes=passes,
+        )
 
     # Each named remedy is one thing worth changing about a refused plate,
     # tried at most once and in this order.
@@ -581,9 +904,19 @@ class OrcaSlicerEngine(SlicerEngine):
         argv += extra or []
         argv.append(source)
 
+        started = time.monotonic()
         proc = self._run(argv, expect_success=False, cwd=workdir)
         output_path = os.path.join(workdir, output_name)
-        if proc.returncode != 0 or not os.path.exists(output_path):
+        sliced = proc.returncode == 0 and os.path.exists(output_path)
+        self._note(
+            plate, "run",
+            "sliced" if sliced else ("refused" + (self._reason(workdir) or f": exit {proc.returncode}")),
+            exit_code=proc.returncode,
+            seconds=round(time.monotonic() - started, 1),
+            flags=list(extra or []),
+            log=self._keep_log(plate, argv, proc, workdir),
+        )
+        if not sliced:
             return proc, None
         return proc, output_path
 
@@ -1385,7 +1718,7 @@ class OrcaSlicerEngine(SlicerEngine):
 
     def _extruder_remap(
         self, source: str, heads: int
-    ) -> tuple[dict[str, dict[str, str]], dict[int, dict[int, int]]]:
+    ) -> tuple[dict[str, dict[str, str]], dict[int, dict[int, int]], dict[str, dict]]:
         """Renumber each plate's filaments into the heads the machine actually has.
 
         **A file's extruder number is a palette slot, not a head.** An assembly
@@ -1412,31 +1745,112 @@ class OrcaSlicerEngine(SlicerEngine):
         slice fails with the binary's own complaint rather than quietly weighing
         the part as the wrong plastic.
 
-        Returns the rewrite to apply to the file, and per plate a
-        `{new number: original number}` map for reading the results back.
+        **The paint goes with the base** (1.13, see paint.py). A part's colour
+        can also be painted on its triangles, and renumbering only the base left
+        a one-colour plate asking for two filaments — a prime tower, and a
+        refusal over layer heights the plate was allowed to have. So the paint
+        is renumbered with the base, and a part painted all over in one colour
+        becomes a part of that colour: base set to it, paint dropped. That is
+        done on every plate, renumbered or not, because the base nobody prints
+        is a filament the engine loads all the same.
+
+        Returns the rewrite to apply to model_settings.config, per plate a
+        `{new number: original number}` map for reading the results back, and
+        the paint changes per mesh file for repair3mf.
         """
-        plates, objects = self._layout(source)
+        plates, bases, painted = self._filaments(source)
         if not plates:
-            return {}, {}
+            return {}, {}, {}
 
         rewrites: dict[str, dict[str, str]] = {}
         palettes: dict[int, dict[int, int]] = {}
+        # Per object: the paint change for each of its meshes — a mapping to
+        # renumber with, or None to drop the paint.
+        wanted: dict[str, tuple[dict[str, str], dict[int, int] | None, dict[str, str]]] = {}
         for index, object_ids in plates.items():
-            used = sorted({e for oid in object_ids for e in objects.get(oid, set())})
-            if not used or used[-1] <= heads:
-                continue
-            if len(used) > heads or not self._interchangeable(source, used):
-                continue
+            used = sorted({e for oid in object_ids for e in self._uses(oid, bases, painted)})
+            mapping: dict[int, int] = {}
+            if used and used[-1] > heads and len(used) <= heads and self._interchangeable(source, used):
+                mapping = {old: new for new, old in enumerate(used, start=1)}
+                palettes[index] = {new: old for old, new in mapping.items()}
+            plain = {str(k): str(v) for k, v in mapping.items()}
 
-            mapping = {old: new for new, old in enumerate(used, start=1)}
-            palettes[index] = {new: old for old, new in mapping.items()}
             for oid in object_ids:
-                rewrites[oid] = {str(k): str(v) for k, v in mapping.items()}
+                found = painted.get(oid)
+                colour = found.uniform if found else None
+                if colour is not None:
+                    target = str(mapping.get(colour, colour))
+                    wanted[oid] = ({str(b): target for b in bases.get(oid, ())}, None, plain)
+                elif found and mapping:
+                    wanted[oid] = (plain, mapping, plain)
+                elif mapping:
+                    rewrites[oid] = plain
 
-        return rewrites, palettes
+        # A mesh two objects share can take only one change. Where they would
+        # want different ones, neither gets its paint touched and each keeps the
+        # plain renumbering: the engine may then refuse as before 1.13, which is
+        # a refusal rather than a part printed in the wrong colour.
+        treatment: dict[tuple[str, str], set] = {}
+        for oid, (_, change, _) in wanted.items():
+            key = None if change is None else tuple(sorted(change.items()))
+            for mesh in painted[oid].meshes:
+                treatment.setdefault(mesh, set()).add(key)
+
+        mesh_paint: dict[str, dict] = {}
+        for oid, (base, change, plain) in wanted.items():
+            meshes = painted[oid].meshes
+            if any(len(treatment[m]) > 1 for m in meshes):
+                if plain:
+                    rewrites[oid] = plain
+                continue
+            rewrites[oid] = base
+            for path, mesh_id in meshes:
+                mesh_paint.setdefault(path, {})[mesh_id] = change
+
+        return rewrites, palettes, mesh_paint
+
+    def _filaments(
+        self, source: str
+    ) -> tuple[dict[int, list[str]], dict[str, set[int]], dict[str, "paint.ObjectPaint"]]:
+        """Plates, each object's own extruders, and the paint on its meshes."""
+        plates, bases = self._base_layout(source)
+        return plates, bases, self._paint(source) if plates else {}
+
+    def _paint(self, source: str) -> dict:
+        """paint.read(), once per file: it reads every mesh, which on the
+        largest files is seconds, and a slice asks for it more than once."""
+        try:
+            stat = os.stat(source)
+        except OSError:
+            return {}
+        key = (os.path.realpath(source), stat.st_size, stat.st_mtime_ns)
+        cached = getattr(self, "_paint_cached", None)
+        if cached and cached[0] == key:
+            return cached[1]
+        try:
+            found = paint.read(source)
+        except (OSError, zipfile.BadZipFile, paint.PaintError):
+            found = {}
+        self._paint_cached = (key, found)
+        return found
+
+    @staticmethod
+    def _uses(oid: str, bases: dict[str, set[int]], painted: dict) -> set[int]:
+        """The filaments an object actually prints with: its base wherever the
+        base shows, and every colour painted on it."""
+        found = painted.get(oid)
+        if not found:
+            return bases.get(oid, set())
+        return (bases.get(oid, set()) if found.base_shows else set()) | found.states
 
     def _layout(self, source: str) -> tuple[dict[int, list[str]], dict[str, set[int]]]:
-        """Which objects sit on which plate, and which filaments each object uses.
+        """Which objects sit on which plate, and which filaments each object
+        prints with — paint included, see _extruder_remap."""
+        plates, bases, painted = self._filaments(source)
+        return plates, {oid: self._uses(oid, bases, painted) for oid in bases}
+
+    def _base_layout(self, source: str) -> tuple[dict[int, list[str]], dict[str, set[int]]]:
+        """Which objects sit on which plate, and which extruders each object states.
 
         An object states one extruder and each of its parts may state another;
         both count, because a plate is only as simple as its busiest piece.

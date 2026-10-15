@@ -54,6 +54,8 @@ import json
 import re
 import zipfile
 
+import paint
+
 PROJECT_CONFIG = "Metadata/project_settings.config"
 MODEL_CONFIG = "Metadata/model_settings.config"
 FILAMENT_CONFIG_PREFIX = "Metadata/filament_settings_"
@@ -225,6 +227,7 @@ def repair(
     object_extruders: dict | None = None,
     object_settings: dict | None = None,
     heads: int | None = None,
+    mesh_paint: dict | None = None,
 ) -> dict:
     """Write a repaired copy of `src` to `dst`. Returns a small report.
 
@@ -232,6 +235,10 @@ def repair(
     and `object_extruders` and `object_settings` to model_settings.config, so none costs anything
     extra — rewriting the archive a second time would mean recompressing tens of
     megabytes of mesh for the sake of one JSON key.
+
+    `mesh_paint` is `{archive path: {mesh object id: {old: new} or None}}` — the
+    paint that has to follow a renumbered base, or be dropped from a part that
+    has become the colour it was painted (see paint.py).
     """
     with zipfile.ZipFile(src) as zin:
         names = set(zin.namelist())
@@ -258,6 +265,9 @@ def repair(
                 settings = _rewrite_object_settings(settings, object_settings or {})
                 zout.writestr(item, _rewrite_extruders(settings, object_extruders or {}))
                 continue
+            if mesh_paint and name in mesh_paint:
+                zout.writestr(item, paint.rewrite_mesh_file(zin.read(name), mesh_paint[name]))
+                continue
             if name.startswith(FILAMENT_CONFIG_PREFIX):
                 cfg = _fix_filament_config(json.loads(zin.read(name)))
                 zout.writestr(name, json.dumps(cfg, indent=4))
@@ -270,7 +280,47 @@ def repair(
         "range_keys_fixed": fixed_keys,
         "filament_configs_fixed": touched_filament_configs,
         "project_overrides_applied": overridden_keys,
+        "mesh_files_repainted": sorted(mesh_paint or {}),
     }
+
+
+ITEM = re.compile(r'\s*<item\s[^>]*objectid="(\d+)"[^>]*/>')
+RESOURCE = re.compile(r'\s*<object\s+id="(\d+)"[^>]*>.*?</object>', re.S)
+INSTANCE = re.compile(r'\s*<model_instance>.*?</model_instance>', re.S)
+INSTANCE_OBJECT = re.compile(r'key="object_id"\s+value="(\d+)"')
+ASSEMBLE_ITEM = re.compile(r'\s*<assemble_item\s[^>]*object_id="(\d+)"[^>]*/>')
+
+
+def drop_objects(src: str, dst: str, object_ids: list[str]) -> None:
+    """A copy of `src` without the named objects — all of each: the resource
+    and build item in 3dmodel.model, and the object, plate entry and assembly
+    entry in model_settings.config. Their meshes in 3D/Objects stay, unreferenced:
+    the engine ignores them, and rewriting them would cost more than it saves.
+
+    Used to print a plate in passes (see OrcaSlicerEngine._split_plan). Removing
+    only the build item leaves the settings naming an object that is not there,
+    and the engine refuses the whole file as unparseable (-6).
+    """
+    drop = set(object_ids)
+
+    def unless(pattern_id):
+        return lambda m: "" if pattern_id(m) in drop else m.group(0)
+
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "3D/3dmodel.model":
+                text = data.decode("utf-8")
+                text = ITEM.sub(unless(lambda m: m.group(1)), text)
+                text = RESOURCE.sub(unless(lambda m: m.group(1)), text)
+                data = text.encode("utf-8")
+            elif item.filename == MODEL_CONFIG:
+                text = data.decode("utf-8")
+                text = INSTANCE.sub(unless(lambda m: (INSTANCE_OBJECT.search(m.group(0)) or [None, None])[1]), text)
+                text = RESOURCE.sub(unless(lambda m: m.group(1)), text)
+                text = ASSEMBLE_ITEM.sub(unless(lambda m: m.group(1)), text)
+                data = text.encode("utf-8")
+            zout.writestr(item, data)
 
 
 if __name__ == "__main__":

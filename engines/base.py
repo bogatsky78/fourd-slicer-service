@@ -56,6 +56,18 @@ class PlateUsage:
     # because it says the file describes a print this machine cannot run as laid
     # out; see OrcaSlicerEngine._remedy().
     adjustments: list[str] = field(default_factory=list)
+    # A plate the engine could not print in one go, printed in several: the
+    # figures above are their sum and each pass is here in the same shape.
+    # Empty for a plate printed in one pass, which is every plate the file laid
+    # out so that it could be. See OrcaSlicerEngine._split_plan().
+    passes: list["PlateUsage"] = field(default_factory=list)
+
+    @property
+    def colours(self) -> int:
+        """Filaments loaded at once — on the busiest pass, when there are passes."""
+        if self.passes:
+            return max(p.colours for p in self.passes)
+        return len([f for f in self.filaments if f.used_g > 0])
 
 
 @dataclass
@@ -278,6 +290,10 @@ class SliceResult:
     # Which plates the totals above are made of, when the request named some;
     # empty for a whole-file slice.
     plates_sliced: list[int] = field(default_factory=list)
+    # What the slice did, step by step, and every engine run's full log —
+    # see OrcaSlicerEngine.slice(). A refusal carries the same two on SliceFailed.
+    journal: list[dict] = field(default_factory=list)
+    engine_logs: list[dict] = field(default_factory=list)
 
     @property
     def filament_count(self) -> int:
@@ -291,10 +307,7 @@ class SliceResult:
         plates hold one colour each prints on a single-head machine."""
         if not self.plates:
             return self.filament_count
-        return max(
-            (len([f for f in p.filaments if f.used_g > 0]) for p in self.plates),
-            default=0,
-        )
+        return max((p.colours for p in self.plates), default=0)
 
 
 @dataclass
@@ -336,6 +349,11 @@ class SliceFailed(RuntimeError):
     #: been given the freest corner of the bed and still crosses, or two parts
     #: in the file's own layout — and no argument of ours would change that.
     CONFLICT = "conflict"
+    #: The plate needs a prime tower and its parts have different layer
+    #: heights, which the engine refuses, and the plate cannot be printed in
+    #: passes either: a flexi model on it, a model whose own parts differ, or
+    #: parts of different heights inside each other's reach.
+    LAYER_HEIGHTS = "layer_heights"
 
     def __init__(
         self,
@@ -348,6 +366,9 @@ class SliceFailed(RuntimeError):
         self.exit_code = exit_code
         self.log = log
         self.reason = reason
+        # Filled in on the way out of OrcaSlicerEngine.slice().
+        self.journal: list[dict] = []
+        self.engine_logs: list[dict] = []
 
 
 class SlicerEngine(abc.ABC):

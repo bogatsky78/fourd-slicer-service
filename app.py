@@ -18,7 +18,7 @@ import render
 from engines import registry
 from engines.base import EngineUnavailable, SliceFailed, SliceRequest
 
-app = FastAPI(title="FourD Slicer Service", version="1.12")
+app = FastAPI(title="FourD Slicer Service", version="1.13")
 
 WORKDIR_ROOT = os.environ.get("SLICER_WORKDIR", "/work")
 
@@ -235,6 +235,8 @@ def _refusal(exc: SliceFailed) -> dict:
         "reason": exc.reason,
         "exit_code": exc.exit_code,
         "log": exc.log,
+        "journal": exc.journal,
+        "engine_logs": exc.engine_logs,
     }
 
 

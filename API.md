@@ -266,6 +266,9 @@ plate 9 of the turtle, at 600x600 (Foxycat at 360x360).
 | `raw` | string, nullable | The tail of the engine's log for the last plate run. Diagnostics; do not parse it. |
 | `plates[]` | list | The same numbers, per plate — `index`, `weight_g`, `print_time_sec`, `filaments[]`, `filament_changes`, `supports`, `warnings[]`, `adjustments[]`. |
 | `plates_sliced` | list of int | The plates the totals are made of, when the request named some with `plates`; empty for a whole-file slice. |
+| `plates[].passes` | list | A plate printed in several passes (1.13): each pass in the same shape as a plate, the plate's own figures being their sum. Empty for a plate printed in one go. |
+| `journal` | list | What the slice did, step by step (1.13). See "The journal" below. |
+| `engine_logs` | list | Every run of the engine, its full log compressed (1.13). See "The journal" below. |
 | `model` | object | Geometry. See below. |
 
 **`max_plate_filaments`, not `filament_count`, is what a head count is compared
@@ -321,6 +324,41 @@ numbers the results back on the way out. A slice consequently reports the colour
 of the *stand-in* slot, so colour and material are read out of the file instead.
 Renumbering happens only where the filaments are interchangeable (same type,
 density, diameter and settings id); where they are not, the file is left alone.
+
+**A plate printed in passes (1.13).** The engine refuses a plate whose parts
+have different layer heights when it has to build a prime tower for it — that
+is, when the plate loads more than one filament; a one-colour plate may mix
+heights freely. Such a plate is printed in passes, one per layer height: the
+same plate run once per height with only the parts of that height on it, every
+part where its author put it and at the height its author gave it. The plate
+then reports the sum, `plates[].passes` the passes, and `adjustments` a line
+naming the heights and the parts. `max_plate_filaments` and the plate's `kind`
+count the busiest **pass**, because that is what a machine loads at once.
+
+A plate is split between models, never inside one (`plates[].models`, below),
+and is refused instead — `reason` `layer_heights` — when it holds a flexi model,
+when one model's own parts have different heights, or when models of different
+heights reach into each other's box.
+
+### The journal
+
+`journal` lists what the slice did, in order, one short entry per step:
+`{plate, pass, step, text, …}`. `pass` is null outside a plate printed in
+passes. The steps:
+
+| `step` | Extra fields | What it records |
+|---|---|---|
+| `prepare` | — | A plate's filaments renumbered onto the machine's heads; paint renumbered with them or dropped from parts painted all over in one colour |
+| `split` | `reason` on a refusal | A plate printed in passes, and which objects went into each — or why it could not be |
+| `run` | `exit_code`, `seconds`, `flags`, `log` | One run of the engine: what it was told beyond the defaults, and `sliced` or `refused: <the engine's sentence>` |
+| `remedy` | `flags` | What the service changed before the next run, and why |
+
+`engine_logs` holds one entry per run of the engine: `name` (the `log` a `run`
+step points to, `plate-4-pass-2-run-1.log`), `plate`, `pass`, `run`, and
+`gzip_base64` — the command line, both output streams and the engine's own log
+file, gzip-compressed and base64-encoded. About 15–30 KB a run once encoded.
+Both fields are on a refusal too (in `detail`), which is where they matter
+most: the service keeps nothing after it answers, so this is the only copy.
 
 ## The `model` block
 
@@ -501,12 +539,13 @@ on.
 **`reason` is present on every refusal and null on most of them.** A name means
 the refusal is a fact about the model, worth storing against the product and
 worth acting on; null means the slicer simply said no, and only the sentence and
-the log describe it. Two names exist today:
+the log describe it. Three names exist today:
 
 | `reason` | What it means | What the caller can do |
 |---|---|---|
 | `off_bed` | The print does not fit the bed of the machine it was sliced for — a part is larger than the bed, or the plate is laid out past its edge | Nothing that involves trying again: a different printer, or a different file |
 | `conflict` | Two toolpaths cross. Either the prime tower crosses a part both where the file puts it and in the freest corner of the bed — the service tried that corner first — or the file's own parts cross each other | Nothing that involves trying again either: a looser layout with a free corner for the tower, or a smaller model |
+| `layer_heights` (1.13) | A plate loading several filaments has parts of different layer heights, which the engine refuses, and it cannot be printed in passes: it holds a flexi model, one model's own parts differ in height, or parts of different heights reach into each other. The message names the plate and each part with its height | One layer height for every part of the plate, or the parts of each height on a plate of their own |
 
 `message` says which of the two it is, and in millimetres: `part 1 is 68.837 mm
 on y against 60.0`, or `no part is larger than the bed (270.0 × 270.0 × 270.05
@@ -523,7 +562,10 @@ longer to say so, and a timeout on the caller's side has to allow for it. A file
 that cannot be sliced at all still cannot be sliced; it only takes longer to hear
 that. A **named** refusal is the exception and arrives at once: `off_bed` and
 `conflict` are deterministic, so repeating them would only spend slices to
-reach the same word.
+reach the same word. `layer_heights` is found before the engine runs at all.
+
+A refusal's `detail` also carries `journal` and `engine_logs` (1.13) — see
+"The journal".
 
 A render that produces nothing returns `detail` as `{"message", "stage", "plate"}`, where
 `message` lists what each stage was asked and what it said. It takes a file with
@@ -595,6 +637,17 @@ and is reported in every response.
   refused the plate on every run, and it was sliced with normal supports
   instead. Only a plate that refused all retries is changed this way, so no
   number a caller already had moves. No field changed shape.
+- **1.13** reads the paint on a file's meshes. Paint is renumbered with the
+  base when a plate's filaments are moved onto the machine's heads, and a part
+  painted all over in one colour is treated as a part of that colour. Before,
+  a one-colour plate could reach the engine asking for two filaments, get a
+  prime tower and be refused over layer heights it was allowed to have — four
+  plates of one author's catalogue. This **moves numbers** where a file paints
+  whole parts over a different base: a plate that loaded a filament it never
+  printed loses its tower (one reference file, plate 3). A plate that does
+  need a tower and mixes layer heights is printed in passes
+  (`plates[].passes`) or refused with the third `reason`, `layer_heights`.
+  Every response and every refusal now carries `journal` and `engine_logs`.
 
 Fields are added, not repurposed. The one thing a caller must handle is the
 difference between a field being **absent** — an older service that has never

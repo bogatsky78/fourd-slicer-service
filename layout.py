@@ -89,6 +89,10 @@ class PlateModel:
     # A shape key for telling copies apart: shell count, triangle count and
     # material. Not published.
     signature: tuple = field(default=(), repr=False)
+    # The model's box on the bed, for telling whether two models could be
+    # printed apart without one being inside the other. Not published.
+    lo: tuple = field(default=(), repr=False)
+    hi: tuple = field(default=(), repr=False)
 
 
 @dataclass
@@ -271,6 +275,8 @@ def _group(shells: list[_Shell]) -> list[PlateModel]:
             object_ids=sorted({shells[i].object_id for i in members}),
             shells=len(members),
             signature=signature,
+            lo=tuple(np.min([shells[i].lo for i in members], axis=0).tolist()),
+            hi=tuple(np.max([shells[i].hi for i in members], axis=0).tolist()),
         ))
     models.sort(key=lambda m: (m.object_ids, -m.shells))
     return models
