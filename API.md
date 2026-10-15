@@ -648,6 +648,8 @@ and is reported in every response.
   need a tower and mixes layer heights is printed in passes
   (`plates[].passes`) or refused with the third `reason`, `layer_heights`.
   Every response and every refusal now carries `journal` and `engine_logs`.
+  **Use 1.13.1**: the 1.13.0 image was published without `paint.py` and does
+  not start.
 
 Fields are added, not repurposed. The one thing a caller must handle is the
 difference between a field being **absent** — an older service that has never

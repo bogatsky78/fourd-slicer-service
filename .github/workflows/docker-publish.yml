@@ -49,25 +49,32 @@ jobs:
 
       # linux/amd64 only. The slicer binary ships as an x86-64 AppImage, so an
       # arm64 image would build and then fail at the first slice.
-      - uses: docker/build-push-action@v6
+      #
+      # Built into the runner first and smoke-tested there, and only then
+      # pushed. 1.13.0 went out the other way round — pushed, then tested — and
+      # a module missing from the COPY line reached all three tags before the
+      # test that would have caught it ran. The push below reuses this build
+      # from the cache, so testing first costs seconds.
+      - name: Build for the smoke test
+        uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
-          push: ${{ startsWith(github.ref, 'refs/tags/') }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          load: true
+          push: false
+          tags: fourd-slicer-service:smoke
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       # A build that starts is not a build that slices: check the engine is
       # actually present and reports a version before the tag is trusted.
       - name: Smoke test
-        if: startsWith(github.ref, 'refs/tags/')
         run: |
-          docker run -d --name smoke -p 8000:8000 ${{ env.IMAGE }}:latest
+          docker run -d --name smoke -p 8000:8000 fourd-slicer-service:smoke
           for i in $(seq 1 30); do
             curl -fsS http://127.0.0.1:8000/health && break || sleep 2
           done
+          curl -fsS http://127.0.0.1:8000/health || { docker logs smoke; exit 1; }
           curl -fsS http://127.0.0.1:8000/engines | tee /dev/stderr | grep -q '"available":true'
           # The renderer is a second thing that can be missing from a build —
           # its numpy and pillow are installed separately from the engine, and
@@ -75,3 +82,14 @@ jobs:
           # the route proves both the import and the wiring.
           curl -fsS http://127.0.0.1:8000/openapi.json | grep -q '"/render"'
           docker rm -f smoke
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
