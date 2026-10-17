@@ -665,6 +665,12 @@ and is reported in every response.
   some name more of them. A plate's colours are now those of the parts that
   print — not of negative parts or modifiers — which stops 1.13 from refusing
   a one-colour plate as a mixed-height tower plate.
+- **1.13.4** slices a plate whose file has a variable layer height and tree
+  supports in the default style, which the engine refused with `-51` on every
+  run. The trees are drawn as `tree_hybrid` — what Bambu Studio, where such
+  files are made, picks for that combination itself — and
+  `plates[].adjustments` says so. No field changed shape; only plates that
+  used to be refused are affected.
 
 Fields are added, not repurposed. The one thing a caller must handle is the
 difference between a field being **absent** — an older service that has never

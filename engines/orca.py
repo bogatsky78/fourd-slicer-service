@@ -115,6 +115,13 @@ FLOATING_LINE = re.compile(r"It seems object (.+?) has floating regions")
 # _remedy() for why it matters.
 TREE_SUPPORT_LINE = re.compile(r"Tree support overhang detection done")
 
+# And it refuses a combination of settings before slicing anything — exit
+# status 205, `-51`, "There are some incorrect slicing parameters" — with the
+# sentence that names the combination on stderr and in result.json. One of them
+# is ours to answer: see the `hybrid_trees` remedy in _remedy().
+INVALID_SETTINGS = -51
+ORGANIC_LAYERING_LINE = re.compile(r"Variable layer height is not supported with Organic supports")
+
 
 @dataclasses.dataclass
 class _Remedy:
@@ -702,7 +709,9 @@ class OrcaSlicerEngine(SlicerEngine):
 
     # Each named remedy is one thing worth changing about a refused plate,
     # tried at most once and in this order.
-    REMEDIES = ("conflict", "tower", "bed", "labels", "supports", "raft", "normal_supports")
+    REMEDIES = (
+        "conflict", "tower", "bed", "labels", "hybrid_trees", "supports", "raft", "normal_supports",
+    )
 
     # How many times a plate refused for no nameable reason is simply run
     # again, unchanged. See _remedy() for why this number and not a smaller one.
@@ -773,6 +782,35 @@ class OrcaSlicerEngine(SlicerEngine):
                     # file name and gives up with "No such file: 0".
                     argv=["--exclude-object=0"],
                     note="object labels switched off, which the file's own ids broke",
+                )
+
+        if code == INVALID_SETTINGS and "hybrid_trees" not in tried:
+            # **Organic trees on a variable layer height.** The reindeer's author
+            # smoothed its layers in Bambu Studio — `layer_heights_profile.txt`,
+            # 0.2 mm up to 18.66 mm and finer above — and left the trees at
+            # `support_style = default`. Orca 2.4.2 reads `default` as organic
+            # and refuses organic trees on custom layering, on every run. Bambu
+            # Studio reads the same `default` as organic only when the layers
+            # are uniform, and as `tree_hybrid` when they are not
+            # (`resolve_support_style()`), so `tree_hybrid` is not a substitute
+            # for what the author printed: it is what the author printed.
+            #
+            # The trees change and the model does not, which is why this and not
+            # the other way out. Dropping the layer profile would move the
+            # model's own grams and hours; a different tree style moves only the
+            # support's. Per plate, not sticky: the profile belongs to an
+            # object, and the plates next to it may keep their organic trees.
+            said = "\n".join((
+                self._log(proc) or "",
+                self._result_json(workdir).get("error_string") or "",
+            ))
+            if ORGANIC_LAYERING_LINE.search(said):
+                return _Remedy(
+                    kind="hybrid_trees",
+                    argv=["--support-style=tree_hybrid"],
+                    note="tree supports drawn as tree_hybrid: organic trees refuse "
+                    "the file's variable layer height, and Bambu Studio picks "
+                    "tree_hybrid for such a file itself",
                 )
 
         if code == SLICE_FAILED:
